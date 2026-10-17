@@ -19,6 +19,8 @@
 #   HABITOOTH_CONCURRENCY  기본 4 (동시에 Bedrock 에 보낼 리포트 수)
 #   HABITOOTH_NO_THINK     기본 1 (프롬프트 끝에 /no_think 추가)
 #   HABITOOTH_TIMEOUT      기본 120 (초, Bedrock read timeout)
+#   HABITOOTH_LEGACY_LLM   기본 1 — 구형 riskDetail 관리 문장도 LLM 으로 생성 (0 이면 코드 문장만)
+#   HABITOOTH_INTERP_LLM   기본 1 — v2 해석(interpretation) 을 LLM 으로 생성 (0 이면 폴백 문장)
 #
 # 프롬프트·카탈로그·집계 규칙은 report_logic.py 에 있고,
 # 고친 뒤 POST /dev/reload 만 치면 서버 재기동 없이 반영된다.
@@ -29,7 +31,7 @@ import re
 import threading
 import time
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import boto3
 from botocore.config import Config
@@ -50,6 +52,8 @@ MAX_RETRY = int(os.getenv("HABITOOTH_RETRY", "4"))
 CONCURRENCY = int(os.getenv("HABITOOTH_CONCURRENCY", "4"))
 NO_THINK = os.getenv("HABITOOTH_NO_THINK", "1") == "1"
 READ_TIMEOUT = int(os.getenv("HABITOOTH_TIMEOUT", "120"))
+LEGACY_LLM = os.getenv("HABITOOTH_LEGACY_LLM", "1") == "1"
+INTERP_LLM = os.getenv("HABITOOTH_INTERP_LLM", "1") == "1"
 
 GEN_SEMAPHORE = threading.Semaphore(CONCURRENCY)
 resources = {}
@@ -137,19 +141,14 @@ async def validation_handler(request: Request, exc: RequestValidationError):
 # 요청/응답 스키마 — Spring 이 보내는 형식 (변경 없음)
 # ══════════════════════════════════════════════════════════════
 class ZoneIn(BaseModel):
+    """analysis_result 행 1개 = (구역 × 광원) 1장. 같은 viewType 이 백색광/UV 로 2번 올 수 있다."""
     viewType: str
-    zoneScore: Optional[float] = 100.0
+    zoneScore: Optional[float] = None          # None = 무효 구역 (Spring 집계와 동일하게 제외)
     zoneValid: bool = True
     detectedToothCount: int = 0
-    totalCalculusRatio: Optional[float] = 0.0
-    totalPlaqueRatio: Optional[float] = 0.0
-
-    @field_validator("zoneScore", "totalCalculusRatio", "totalPlaqueRatio", mode="before")
-    @classmethod
-    def null_to_default(cls, v, info):
-        if v is None:
-            return 100.0 if info.field_name == "zoneScore" else 0.0
-        return v
+    totalCalculusRatio: Optional[float] = None
+    totalPlaqueRatio: Optional[float] = None
+    lightType: Optional[str] = None            # "WHITE" / "UV" — 없으면 비율 null 여부로 추정
 
 
 class ToothAreaIn(BaseModel):
@@ -158,6 +157,7 @@ class ToothAreaIn(BaseModel):
     areaRatio: Optional[float] = 0.0
     toothScore: Optional[float] = 100.0
     riskLevel: str = "MEDIUM"
+    viewType: Optional[str] = None             # 아직 Spring 이 안 보냄. 오면 보관만 한다.
 
     @field_validator("areaRatio", "toothScore", mode="before")
     @classmethod
@@ -170,12 +170,26 @@ class ToothAreaIn(BaseModel):
 class ReportRequest(BaseModel):
     zones: Optional[List[ZoneIn]] = None
     teeth: List[ToothAreaIn] = []
-    prevTeeth: Optional[List[List]] = None
+    # [[16,"CALCULUS"]] (구형) 과 [{"toothNumber":16,"lesionType":"CALCULUS","areaRatio":12.1}] (신형) 모두 허용
+    prevTeeth: Optional[List[Any]] = None
+    # ── v2 (Spring 이 아직 안 보내면 None → 서버가 zones 로 재계산)
+    totalScore: Optional[float] = None
+    prevTotalScore: Optional[float] = None
+    prevZones: Optional[List[ZoneIn]] = None
+    capturedZoneCount: Optional[int] = None
+    totalZoneCount: Optional[int] = None
 
     @field_validator("teeth", mode="before")
     @classmethod
     def none_to_empty(cls, v):
         return v or []
+
+
+def _unpack(req: ReportRequest):
+    zones = [z.model_dump() for z in (req.zones or [])]
+    teeth = [t.model_dump() for t in (req.teeth or [])]
+    prev_zones = [z.model_dump() for z in (req.prevZones or [])] or None
+    return zones, teeth, req.prevTeeth, prev_zones
 
 
 # ══════════════════════════════════════════════════════════════
@@ -256,6 +270,39 @@ def run_generation(s: dict, picked: list, max_retry: int = MAX_RETRY):
     return last
 
 
+def run_interpretation(ctx: dict, actions: list, max_retry: int = MAX_RETRY):
+    """v2 해석 3문장. 반환 (문장 리스트, source). source: llm / fallback / code"""
+    fallback = report_logic.build_fallback_interpretation(ctx)
+    if not ctx["s"]["has_issue"] or not INTERP_LLM:
+        return fallback, "code"
+    llm_input = report_logic.build_llm_input(ctx, actions)
+    user_prompt = report_logic.build_interp_prompt(llm_input)
+    for i in range(max_retry):
+        greedy = (i == max_retry - 1)
+        temperature, top_p = (0.0, 1.0) if greedy else (0.5, 0.9)
+        t0 = time.time()
+        print(f"[INTERP] 시도 {i+1}/{max_retry} (temp={temperature})")
+        try:
+            text, usage, stop = converse(report_logic.INTERP_SYSTEM_PROMPT, user_prompt, temperature, top_p)
+        except (ClientError, BotoCoreError) as e:
+            print(f"[INTERP] Bedrock 오류: {e}")
+            continue
+        print(f"[INTERP] in={usage.get('inputTokens')} out={usage.get('outputTokens')} "
+              f"/ {time.time()-t0:.1f}초 stop={stop}")
+        out = extract_json(text)
+        if not out or "interpretation" not in out:
+            print(f"[INTERP] JSON 파싱 실패 | 원문 앞부분: {text[:120]!r}")
+            continue
+        sents = report_logic.finalize_interpretation(out["interpretation"]) \
+            if isinstance(out["interpretation"], list) else None
+        fails = report_logic.validate_interpretation(sents, llm_input)
+        if not fails:
+            return sents, "llm"
+        print(f"[INTERP] 검증 실패: {fails} | {sents}")
+    print("[INTERP] 재시도 소진 → 폴백 문장 사용")
+    return fallback, "fallback"
+
+
 # ══════════════════════════════════════════════════════════════
 # 엔드포인트 — Spring 이 호출
 # ══════════════════════════════════════════════════════════════
@@ -267,24 +314,35 @@ def generate_llm_report(req: ReportRequest):
             detail="리포트 생성 요청이 많습니다. 잠시 후 다시 시도해 주세요.",
         )
     try:
-        zones = [z.model_dump() for z in (req.zones or [])]
-        teeth = [t.model_dump() for t in (req.teeth or [])]
-        prev_set = {(p[0], p[1]) for p in req.prevTeeth} if req.prevTeeth else None
+        zones, teeth, prev_teeth, prev_zones = _unpack(req)
 
-        s = report_logic.aggregate_session(teeth, zones, prev_set)
+        # ── 코드: 집계 → 점수 분해 → reason code → 할 일 (LLM 없이 완성)
+        s = report_logic.aggregate_session(teeth, zones, prev_teeth)
+        score = report_logic.compute_score(zones, prev_zones, req.totalScore, req.prevTotalScore,
+                                           req.capturedZoneCount, req.totalZoneCount)
+        ctx = report_logic.build_context(s, score)
+        actions = report_logic.build_actions(ctx)
         picked = report_logic.select_management(s, k=3)
-        print(f"[LLM] 병변 {s['issue_cnt']}건 / 관리법 {picked}")
+        print(f"[LLM] 병변 {s['issue_cnt']}건 / 점수 {score['total']} "
+              f"(치석 -{score['calculusDeduction']} 치태 -{score['plaqueDeduction']}) "
+              f"/ reason {ctx['primary']} {ctx['flags']} / 할 일 {[a['code'] for a in actions]}")
 
+        # ── 구형 섹션 (riskDetail / management) — 앱이 새 UI 로 바뀔 때까지 유지
         if not s["has_issue"]:
             report = report_logic.build_healthy_report(s, picked)
-            return {"isSuccess": True, "result": report}
+        elif LEGACY_LLM:
+            report = run_generation(s, picked) or report_logic.build_code_only_report(s, picked)
+        else:
+            report = report_logic.build_code_only_report(s, picked)
 
-        report = run_generation(s, picked)
-        if report is None:
-            raise HTTPException(
-                status_code=502,
-                detail=f"LLM 리포트 생성 실패 (재시도 {MAX_RETRY}회 초과)",
-            )
+        # ── v2 섹션
+        interp, source = run_interpretation(ctx, actions)
+        report["score"] = report_logic.score_payload(ctx)
+        report["interpretation"] = interp
+        report["interpretationSource"] = source
+        report["actions"] = actions
+        report["logicVersion"] = report_logic.LOGIC_VERSION
+        report["disclaimer"] = report_logic.DISCLAIMER
         return {"isSuccess": True, "result": report}
     finally:
         GEN_SEMAPHORE.release()
@@ -301,22 +359,33 @@ def dev_reload():
 
 @app.post("/dev/dry-run")
 def dev_dry_run(req: ReportRequest):
-    """모델을 호출하지 않고 집계·관리법 선택·프롬프트만 확인한다."""
-    zones = [z.model_dump() for z in (req.zones or [])]
-    teeth = [t.model_dump() for t in req.teeth]
-    prev_set = {(p[0], p[1]) for p in req.prevTeeth} if req.prevTeeth else None
-    s = report_logic.aggregate_session(teeth, zones, prev_set)
+    """모델을 호출하지 않고 집계·점수 분해·할 일·프롬프트·폴백 문장만 확인한다."""
+    zones, teeth, prev_teeth, prev_zones = _unpack(req)
+    s = report_logic.aggregate_session(teeth, zones, prev_teeth)
+    score = report_logic.compute_score(zones, prev_zones, req.totalScore, req.prevTotalScore,
+                                       req.capturedZoneCount, req.totalZoneCount)
+    ctx = report_logic.build_context(s, score)
+    actions = report_logic.build_actions(ctx)
     picked = report_logic.select_management(s, k=3)
-    prompt = report_logic.build_report_prompt(s, picked)
-    sys_blocks, messages = build_messages(report_logic.SYSTEM_PROMPT, prompt)
+    llm_input = report_logic.build_llm_input(ctx, actions)
+    interp_prompt = report_logic.build_interp_prompt(llm_input)
+    legacy_prompt = report_logic.build_report_prompt(s, picked)
     return {
-        "session": s,
-        "groups": report_logic.group_by_lesion(s),
-        "picked": picked,
-        "picked_titles": [report_logic.MANAGEMENT_CATALOG[k]["title"] for k in picked],
-        "prompt": prompt,
-        "chat_text": {"system": sys_blocks, "messages": messages},   # Bedrock 에 보내는 실제 페이로드
-        "management": report_logic.build_management(s, picked),
+        "session": {k: v for k, v in s.items() if k != "issues"},
+        "issues": s["issues"],
+        "score": report_logic.score_payload(ctx),
+        "primary_reason": ctx["primary"], "flags": ctx["flags"],
+        "actions": actions,
+        "llm_input": llm_input,
+        "interp_prompt": interp_prompt,
+        "fallback_interpretation": report_logic.build_fallback_interpretation(ctx),
+        "legacy": {
+            "groups": report_logic.group_by_lesion(s),
+            "picked": picked,
+            "picked_titles": [report_logic.MANAGEMENT_CATALOG[k]["title"] for k in picked],
+            "prompt": legacy_prompt,
+            "management": report_logic.build_management(s, picked),
+        },
     }
 
 
@@ -335,6 +404,7 @@ def dev_phrase_stats_reset():
 def health():
     return {"status": "ok", "backend": "bedrock", "model_id": MODEL_ID, "region": REGION,
             "ping_ok": resources.get("ping_ok"),
+            "legacy_llm": LEGACY_LLM, "interp_llm": INTERP_LLM,
             "logic_version": getattr(report_logic, "LOGIC_VERSION", "(없음 — 옛 파일)")}
 
 

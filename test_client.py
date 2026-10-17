@@ -9,6 +9,8 @@
 #   python test_client.py --case stress      # 32개 치아 × 2병변 = 64행
 #   python test_client.py --case full --dry  # 모델 안 돌리고 프롬프트만
 #   python test_client.py --case all         # 전 케이스 순차 실행
+#   python test_client.py --case v2-new-calculus --dry   # v2: 점수 분해·할 일·프롬프트·폴백만
+#   python test_client.py --case v2 --v2     # v2 케이스 6개 실제 생성, score/interpretation/actions 만 출력
 #   python test_client.py --base https://xxxx.trycloudflare.com   # Colab 터널
 import argparse
 import json
@@ -123,6 +125,104 @@ def build_stress():
     return rows
 
 
+# ══════════════════════════════════════════════════════════════
+# v2 케이스 — 13구역 + 광원별 2행 + prevTeeth 객체형 + totalScore
+# Spring 이 실제로 보내는 형태를 흉내낸다. zoneScore 는 병변별 치아 점수 평균(= 100 − 3×평균면적비).
+# ══════════════════════════════════════════════════════════════
+def _z(view, light, score, detected=4, calc=None, plq=None, valid=True):
+    return {"viewType": view, "lightType": light, "zoneScore": score, "zoneValid": valid,
+            "detectedToothCount": detected, "totalCalculusRatio": calc, "totalPlaqueRatio": plq}
+
+
+def _t(tooth, lesion, ratio):
+    return {"toothNumber": tooth, "lesionType": lesion, "areaRatio": ratio,
+            "toothScore": round(100 - 3 * ratio, 1), "riskLevel": _risk(ratio / 100)}
+
+
+# A. 신규 치석 지배 (목업 사용자): 3구역, 치태 거의 없음, 치석 4곳 전부 새로 생김, 점수 급락
+V2_A_ZONES = [
+    _z("LOWER_FRONT", "WHITE", 80.0, 4, calc=6.7),   _z("LOWER_FRONT", "UV", 99.4, 4, plq=0.2),
+    _z("UPPER_FRONT", "WHITE", 88.0, 4, calc=4.0),   _z("UPPER_FRONT", "UV", 100.0, 4, plq=0.0),
+    _z("OUTER_CENTER", "WHITE", 95.0, 6, calc=1.7),  _z("OUTER_CENTER", "UV", 99.0, 6, plq=0.3),
+]
+V2_A_TEETH = [_t(41, "CALCULUS", 18.0), _t(42, "CALCULUS", 8.7), _t(11, "CALCULUS", 12.0),
+              _t(21, "CALCULUS", 4.0), _t(41, "PLAQUE", 0.8), _t(31, "PLAQUE", 0.6)]
+V2_A_PREV = [{"toothNumber": 41, "lesionType": "PLAQUE", "areaRatio": 6.2}]
+
+# B. 치태 지배 (첫 촬영, 비교 없음): 어금니 설측 치태 많음, 치석 없음
+V2_B_ZONES = [
+    _z("LOWER_LEFT_MOLAR", "WHITE", 100.0, 3, calc=0.0), _z("LOWER_LEFT_MOLAR", "UV", 70.0, 3, plq=10.0),
+    _z("LOWER_RIGHT_MOLAR", "WHITE", 100.0, 3, calc=0.0), _z("LOWER_RIGHT_MOLAR", "UV", 76.0, 3, plq=8.0),
+    _z("LOWER_FRONT", "WHITE", 100.0, 4, calc=0.0),       _z("LOWER_FRONT", "UV", 88.0, 4, plq=4.0),
+]
+V2_B_TEETH = [_t(36, "PLAQUE", 14.2), _t(37, "PLAQUE", 9.0), _t(46, "PLAQUE", 11.0), _t(47, "PLAQUE", 5.0),
+              _t(41, "PLAQUE", 6.0), _t(31, "PLAQUE", 4.0)]
+
+# C. 치석 유지 + 치태 감소 (개선 중): 지난번 대비 치태 줄고 치석 그대로
+V2_C_ZONES = [
+    _z("LOWER_FRONT", "WHITE", 90.8, 5, calc=3.1),  _z("LOWER_FRONT", "UV", 75.0, 5, plq=8.3),
+    _z("UPPER_FRONT", "WHITE", 98.0, 4, calc=0.7),  _z("UPPER_FRONT", "UV", 92.0, 4, plq=2.7),
+]
+V2_C_PREV_ZONES = [
+    _z("LOWER_FRONT", "WHITE", 90.8, 5, calc=3.1),  _z("LOWER_FRONT", "UV", 68.0, 5, plq=10.7),
+    _z("UPPER_FRONT", "WHITE", 98.0, 4, calc=0.7),  _z("UPPER_FRONT", "UV", 86.0, 4, plq=4.7),
+]
+V2_C_TEETH = [_t(41, "CALCULUS", 12.1), _t(31, "CALCULUS", 3.2),
+              _t(41, "PLAQUE", 23.0), _t(31, "PLAQUE", 14.2), _t(42, "PLAQUE", 4.5), _t(11, "PLAQUE", 5.0)]
+V2_C_PREV = [{"toothNumber": 41, "lesionType": "CALCULUS", "areaRatio": 12.1},
+             {"toothNumber": 31, "lesionType": "CALCULUS", "areaRatio": 3.0},
+             {"toothNumber": 41, "lesionType": "PLAQUE", "areaRatio": 31.0},
+             {"toothNumber": 31, "lesionType": "PLAQUE", "areaRatio": 18.0},
+             {"toothNumber": 42, "lesionType": "PLAQUE", "areaRatio": 9.0},
+             {"toothNumber": 11, "lesionType": "PLAQUE", "areaRatio": 7.0},
+             {"toothNumber": 21, "lesionType": "PLAQUE", "areaRatio": 6.0}]
+
+# D. 깨끗 (지난번 치태 사라짐)
+V2_D_ZONES = [_z(v, l, 100.0, 4, calc=0.0 if l == "WHITE" else None, plq=0.0 if l == "UV" else None)
+              for v in ("UPPER_FRONT", "LOWER_FRONT", "OUTER_CENTER", "LOWER_LEFT_MOLAR",
+                        "LOWER_RIGHT_MOLAR", "UPPER_LEFT_MOLAR", "UPPER_RIGHT_MOLAR")
+              for l in ("WHITE", "UV")]
+V2_D_PREV = [{"toothNumber": 36, "lesionType": "PLAQUE", "areaRatio": 5.0},
+             {"toothNumber": 41, "lesionType": "PLAQUE", "areaRatio": 3.0}]
+
+# E. 저커버리지 (2구역만) + 치석 1곳 + 구형 prevTeeth 배열 + 무효 구역 1개
+V2_E_ZONES = [
+    _z("LOWER_FRONT", "WHITE", 94.0, 4, calc=2.0),  _z("LOWER_FRONT", "UV", 97.0, 4, plq=1.0),
+    _z("OUTER_CENTER", "WHITE", None, 1, calc=None, valid=False),
+]
+V2_E_TEETH = [_t(41, "CALCULUS", 8.0), _t(31, "PLAQUE", 2.0)]
+V2_E_PREV = [[41, "CALCULUS"], [36, "PLAQUE"]]
+
+# F. 악화: 치석 유지 + 치태 증가, Spring totalScore 와 재계산이 어긋나는 경우(경고 로그 확인용)
+V2_F_ZONES = [
+    _z("LOWER_FRONT", "WHITE", 85.0, 5, calc=5.0),       _z("LOWER_FRONT", "UV", 70.0, 5, plq=10.0),
+    _z("LOWER_LEFT_MOLAR", "WHITE", 80.0, 3, calc=6.7),  _z("LOWER_LEFT_MOLAR", "UV", 64.0, 3, plq=12.0),
+    _z("UPPER_FRONT", "WHITE", 97.0, 4, calc=1.0),       _z("UPPER_FRONT", "UV", 82.0, 4, plq=6.0),
+]
+V2_F_TEETH = [_t(41, "CALCULUS", 15.0), _t(31, "CALCULUS", 10.0), _t(36, "CALCULUS", 20.0),
+              _t(41, "PLAQUE", 18.0), _t(31, "PLAQUE", 12.0), _t(36, "PLAQUE", 22.0), _t(37, "PLAQUE", 14.0),
+              _t(11, "PLAQUE", 9.0), _t(21, "PLAQUE", 3.0)]
+V2_F_PREV = [{"toothNumber": 41, "lesionType": "CALCULUS", "areaRatio": 15.0},
+             {"toothNumber": 31, "lesionType": "CALCULUS", "areaRatio": 9.0},
+             {"toothNumber": 36, "lesionType": "CALCULUS", "areaRatio": 19.0},
+             {"toothNumber": 41, "lesionType": "PLAQUE", "areaRatio": 10.0},
+             {"toothNumber": 36, "lesionType": "PLAQUE", "areaRatio": 12.0}]
+
+V2_CASES = {
+    "v2-new-calculus": {"zones": V2_A_ZONES, "teeth": V2_A_TEETH, "prevTeeth": V2_A_PREV,
+                        "totalScore": 87.3, "prevTotalScore": 96.0, "capturedZoneCount": 3},
+    "v2-plaque":       {"zones": V2_B_ZONES, "teeth": V2_B_TEETH, "prevTeeth": None,
+                        "capturedZoneCount": 3},
+    "v2-improving":    {"zones": V2_C_ZONES, "teeth": V2_C_TEETH, "prevTeeth": V2_C_PREV,
+                        "prevZones": V2_C_PREV_ZONES, "capturedZoneCount": 2},
+    "v2-clean":        {"zones": V2_D_ZONES, "teeth": [], "prevTeeth": V2_D_PREV,
+                        "totalScore": 100.0, "prevTotalScore": 96.0, "capturedZoneCount": 7},
+    "v2-low-coverage": {"zones": V2_E_ZONES, "teeth": V2_E_TEETH, "prevTeeth": V2_E_PREV,
+                        "capturedZoneCount": 2},
+    "v2-worsening":    {"zones": V2_F_ZONES, "teeth": V2_F_TEETH, "prevTeeth": V2_F_PREV,
+                        "totalScore": 70.0, "prevTotalScore": 78.0, "capturedZoneCount": 3},
+}
+
 CASES = {
     "empty":  {"zones": ZONES_CLEAN,     "teeth": [],             "prevTeeth": None},
     "mid":    {"zones": ZONES_DIRTY,     "teeth": TEETH_MID,      "prevTeeth": None},
@@ -140,10 +240,28 @@ CASES = {
     # 이전 측정이 있지만 사라진 게 하나도 없는 케이스 — resolved_note 가 안 붙는다.
     "mid-prev-nogain": {"zones": ZONES_DIRTY, "teeth": TEETH_MID,
                         "prevTeeth": [[16, "CALCULUS"], [11, "PLAQUE"]]},
+    **V2_CASES,
 }
 
 
-def run_case(base: str, case: str, dry: bool, timeout: int):
+def _print_v2(data: dict):
+    r = data.get("result", data)
+    sc = r.get("score") or {}
+    print(f"\n[점수] {sc.get('total')} (지난 {sc.get('prevTotal')}, Δ{sc.get('delta')})  "
+          f"감점 치석 {sc.get('calculusDeduction')} / 치태 {sc.get('plaqueDeduction')}  "
+          f"상한 칫솔질 {sc.get('ceilingByBrushing')} / 스케일링 {sc.get('ceilingAfterScaling')}  "
+          f"촬영 {sc.get('capturedZoneCount')}/{sc.get('totalZoneCount')}  reason={sc.get('primaryReason')} {sc.get('flags')}")
+    if sc.get("scoreMismatch"):
+        print(f"  ⚠ 점수 불일치: {sc['scoreMismatch']}")
+    print(f"[해석 · {r.get('interpretationSource')}]")
+    for x in r.get("interpretation", []):
+        print(f"  - {x}")
+    print("[할 일]")
+    for a in r.get("actions", []):
+        print(f"  {a['title']}  [{a['tag']}]  — {a['detail']}")
+
+
+def run_case(base: str, case: str, dry: bool, timeout: int, v2_only: bool = False):
     payload = CASES[case]
     endpoint = "/dev/dry-run" if dry else "/api/llm/report/generate"
     n = len(payload["teeth"])
@@ -155,14 +273,20 @@ def run_case(base: str, case: str, dry: bool, timeout: int):
         print(f"  응답 {r.status_code} [{datetime.now():%H:%M:%S}]")
         data = r.json()
         if dry:
-            print("\n[집계]", json.dumps(
-                {k: v for k, v in data["session"].items() if k != "issues"},
-                ensure_ascii=False))
-            print("\n[그룹]")
-            for g in data["groups"]:
-                print(f"  - {g['lesion_kr']} / {g['regions_text']} / 치아 {g['tooth_cnt']}개 / {g['riskLevel']}")
-            print("\n[선택된 관리법]", data["picked_titles"])
-            print("\n[프롬프트]\n" + data["prompt"])
+            print("\n[집계]", json.dumps(data["session"], ensure_ascii=False))
+            print("\n[점수]", json.dumps(data["score"], ensure_ascii=False))
+            print("\n[할 일]")
+            for a in data["actions"]:
+                print(f"  {a['title']}  [{a['tag']}]  — {a['detail']}")
+            print("\n[폴백 해석]")
+            for x in data["fallback_interpretation"]:
+                print(f"  - {x}")
+            print("\n[LLM 입력]", json.dumps(data["llm_input"], ensure_ascii=False))
+            if not v2_only:
+                print("\n[구형 관리법]", data["legacy"]["picked_titles"])
+                print("\n[해석 프롬프트]\n" + data["interp_prompt"])
+        elif v2_only:
+            _print_v2(data)
         else:
             print(json.dumps(data, ensure_ascii=False, indent=2))
     except requests.exceptions.Timeout:
@@ -177,17 +301,23 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://localhost:8001")
     ap.add_argument("--case", default="mid",
-                    choices=list(CASES) + ["all"])
+                    choices=list(CASES) + ["all", "v2"])
     ap.add_argument("--dry", action="store_true")
+    ap.add_argument("--v2", action="store_true", help="score / interpretation / actions 만 출력")
     ap.add_argument("--timeout", type=int, default=1200)
     # 예전 호출 방식(python test_client.py dry) 호환
     if len(sys.argv) > 1 and sys.argv[1] == "dry":
         sys.argv[1] = "--dry"
     args = ap.parse_args()
 
-    cases = list(CASES) if args.case == "all" else [args.case]
+    if args.case == "all":
+        cases = list(CASES)
+    elif args.case == "v2":
+        cases = list(V2_CASES)
+    else:
+        cases = [args.case]
     for c in cases:
-        run_case(args.base.rstrip("/"), c, args.dry, args.timeout)
+        run_case(args.base.rstrip("/"), c, args.dry, args.timeout, v2_only=args.v2 or c.startswith("v2-"))
 
 
 if __name__ == "__main__":

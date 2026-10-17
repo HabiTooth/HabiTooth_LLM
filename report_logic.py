@@ -40,7 +40,7 @@ from collections import Counter
 # ══════════════════════════════════════════════════════════════
 # 이 값을 고칠 때마다 올린다. /dev/reload 와 /health 응답에 그대로 나와서
 # 콜랩에 올린 파일이 실제로 반영됐는지 바로 확인할 수 있다.
-LOGIC_VERSION = "2026-09-17-phrase-stats"
+LOGIC_VERSION = "2026-10-17-score-v2"
 
 DISCLAIMER = ("HabiTooth의 분석 결과는 구강 상태 파악을 돕는 보조 진단 및 참고 목적으로만 제공되며, "
               "전문적인 의료 자문, 확진 및 치료를 대신하지 않습니다. "
@@ -50,10 +50,45 @@ LESION_KR = {"CALCULUS": "치석", "PLAQUE": "치태"}
 CHANGE_KR = {"NEW": " (새로 발견)", "PERSISTED": " (계속 관찰됨)", None: ""}
 RISK_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "VERY_LOW": 4}
 
+# 13구역 (AI 서버 app/zones.py 의 ZONE_FDI_WHITELIST 와 같은 이름).
+# 설측 10구역은 "안쪽", 협측 3구역은 "바깥쪽" 으로 끝나 사용자 문장에 그대로 들어간다.
 VIEW_KR = {
+    "UPPER_RIGHT_MOLAR":    "오른쪽 위 어금니 안쪽",
+    "UPPER_RIGHT_PREMOLAR": "오른쪽 위 작은어금니 안쪽",
+    "UPPER_FRONT":          "위 앞니 안쪽",
+    "UPPER_LEFT_PREMOLAR":  "왼쪽 위 작은어금니 안쪽",
+    "UPPER_LEFT_MOLAR":     "왼쪽 위 어금니 안쪽",
+    "LOWER_RIGHT_MOLAR":    "오른쪽 아래 어금니 안쪽",
+    "LOWER_RIGHT_PREMOLAR": "오른쪽 아래 작은어금니 안쪽",
+    "LOWER_FRONT":          "아래 앞니 안쪽",
+    "LOWER_LEFT_PREMOLAR":  "왼쪽 아래 작은어금니 안쪽",
+    "LOWER_LEFT_MOLAR":     "왼쪽 아래 어금니 안쪽",
+    "OUTER_RIGHT":          "오른쪽 바깥쪽",
+    "OUTER_CENTER":         "앞니 바깥쪽",
+    "OUTER_LEFT":           "왼쪽 바깥쪽",
+    # 구 9구역 이름 — 옛 테스트 데이터 호환용. 신규 요청에는 오지 않는다.
     "UPPER_RIGHT": "위턱 오른쪽", "UPPER_CENTER": "위턱 앞쪽", "UPPER_LEFT": "위턱 왼쪽",
     "LOWER_RIGHT": "아래턱 오른쪽", "LOWER_CENTER": "아래턱 앞쪽", "LOWER_LEFT": "아래턱 왼쪽",
-    "OUTER_RIGHT": "바깥쪽 오른쪽", "OUTER_CENTER": "바깥쪽 앞니", "OUTER_LEFT": "바깥쪽 왼쪽",
+}
+TOTAL_ZONE_COUNT = 13
+
+# 미촬영 구역을 묶어서 "어금니 안쪽도 촬영해 보세요" 처럼 말하기 위한 그룹.
+ZONE_GROUP = {
+    "UPPER_RIGHT_MOLAR": "MOLAR", "UPPER_LEFT_MOLAR": "MOLAR",
+    "LOWER_RIGHT_MOLAR": "MOLAR", "LOWER_LEFT_MOLAR": "MOLAR",
+    "UPPER_RIGHT_PREMOLAR": "PREMOLAR", "UPPER_LEFT_PREMOLAR": "PREMOLAR",
+    "LOWER_RIGHT_PREMOLAR": "PREMOLAR", "LOWER_LEFT_PREMOLAR": "PREMOLAR",
+    "UPPER_FRONT": "FRONT", "LOWER_FRONT": "FRONT",
+    "OUTER_RIGHT": "OUTER", "OUTER_CENTER": "OUTER", "OUTER_LEFT": "OUTER",
+}
+ZONE_GROUP_KR = {"MOLAR": "어금니 안쪽", "PREMOLAR": "작은어금니 안쪽",
+                 "FRONT": "앞니 안쪽", "OUTER": "바깥쪽"}
+# 재촬영 권유 시 그룹별 한 줄 이유
+ZONE_GROUP_WHY = {
+    "MOLAR": "치석이 잘 생기는 자리",
+    "PREMOLAR": "칫솔이 지나치기 쉬운 자리",
+    "FRONT": "침샘과 가까워 치석이 잘 생기는 자리",
+    "OUTER": "치태가 눈에 띄기 쉬운 자리",
 }
 
 # zoneScore 는 "높을수록 깨끗함" 이라고 가정했다. 반대라면 부등호를 뒤집을 것.
@@ -627,42 +662,81 @@ def summarize_regions(regions, max_items: int = MAX_REGIONS_LISTED) -> str:
     return ", ".join(out) if out else ", ".join(regions[:max_items])
 
 
+def normalize_prev_issues(prev):
+    """
+    prevTeeth 를 {(toothNumber, lesionType): areaRatio|None} 으로 통일한다.
+    받아들이는 형태 (Spring 이 바뀌기 전후 모두 지원 — 동시 배포 불필요):
+      - None                                     → 이전 측정 없음 (None 반환)
+      - set/list of (tooth, lesion)              → 구형
+      - list of [tooth, lesion] / [tooth, lesion, ratio]
+      - list of {toothNumber, lesionType, areaRatio?}
+    """
+    if prev is None:
+        return None
+    out = {}
+    for p in prev:
+        if isinstance(p, dict):
+            t, l, r = p.get("toothNumber"), p.get("lesionType"), p.get("areaRatio")
+        else:
+            seq = list(p)
+            if len(seq) < 2:
+                continue
+            t, l = seq[0], seq[1]
+            r = seq[2] if len(seq) > 2 else None
+        if t is None or l is None:
+            continue
+        key = (int(t), str(l))
+        r = float(r) if r is not None else None
+        # 같은 치아가 여러 행이면 큰 비율을 남긴다 (현재 세션과 같은 규칙)
+        if key not in out or (r is not None and (out[key] is None or r > out[key])):
+            out[key] = r
+    return out
+
+
 def aggregate_session(teeth, zones=None, prev_issue_set=None) -> dict:
     """
     teeth : analysis_tooth_area 행들 (dict)
             {toothNumber, lesionType, areaRatio, toothScore, riskLevel}
     zones : analysis_result 행들 (dict)
             {viewType, zoneScore, zoneValid, detectedToothCount, totalCalculusRatio, totalPlaqueRatio}
+    prev_issue_set : normalize_prev_issues() 가 받는 어떤 형태든. None 이면 첫 측정.
     """
     zones = zones or []
     teeth = [t for t in teeth if t.get("lesionType")]
+    prev_map = normalize_prev_issues(prev_issue_set)
 
-    # 같은 (치아, 병변)은 areaRatio 가 가장 큰 행만 남긴다 (confidence 대신)
+    # 같은 (치아, 병변)은 areaRatio 가 가장 큰 행만 남긴다 (confidence 대신).
+    # 설측·순측 양쪽에서 찍힌 치아도 여기서 1개로 합쳐진다 (가장 나쁜 면 기준).
     issue_map = {}
     for t in teeth:
         key = (t["toothNumber"], t["lesionType"])
         cur = issue_map.get(key)
-        if cur is None or t.get("areaRatio", 0.0) > cur.get("areaRatio", 0.0):
+        if cur is None or (t.get("areaRatio") or 0.0) > (cur.get("areaRatio") or 0.0):
             issue_map[key] = t
 
     issues = []
     for (tooth, lesion), t in issue_map.items():
-        if prev_issue_set is None:
-            change = None
-        elif (tooth, lesion) in prev_issue_set:
-            change = "PERSISTED"
+        ratio = float(t.get("areaRatio") or 0.0)
+        if prev_map is None:
+            change, prev_ratio = None, None
+        elif (tooth, lesion) in prev_map:
+            change, prev_ratio = "PERSISTED", prev_map[(tooth, lesion)]
         else:
-            change = "NEW"
+            change, prev_ratio = "NEW", None
         issues.append({
             "tooth": tooth,
             "region": fdi_to_region(tooth),
             "lesion": lesion,
             "lesion_kr": LESION_KR.get(lesion, lesion),
             "riskLevel": t.get("riskLevel", "MEDIUM"),
-            "coverage": coverage_kr(t.get("areaRatio", 0.0)),
+            "coverage": coverage_kr(ratio),
             "change": change,
+            "ratio": round(ratio, 1),
+            "prev_ratio": round(prev_ratio, 1) if prev_ratio is not None else None,
+            "delta_ratio": (round(ratio - prev_ratio, 1) if prev_ratio is not None else None),
         })
-    issues.sort(key=lambda x: (RISK_ORDER.get(x["riskLevel"], 5), x["tooth"]))
+    issues.sort(key=lambda x: (RISK_ORDER.get(x["riskLevel"], 5), -x["ratio"], x["tooth"]))
+    prev_issue_set = set(prev_map.keys()) if prev_map is not None else None
 
     if DEV_LIMIT:      # 배포에서는 None 이라 통과
         kept, cnt = [], {}
@@ -673,23 +747,34 @@ def aggregate_session(teeth, zones=None, prev_issue_set=None) -> dict:
                 cnt[it["lesion"]] = c + 1
         issues = kept
 
-    resolved = []
+    resolved, resolved_keys = [], []
     if prev_issue_set is not None:
-        gone = prev_issue_set - set(issue_map.keys())
-        resolved = [f"{fdi_to_region(t)} {LESION_KR.get(l, l)}" for t, l in sorted(gone)]
+        gone = sorted(prev_issue_set - set(issue_map.keys()))
+        resolved = [f"{fdi_to_region(t)} {LESION_KR.get(l, l)}" for t, l in gone]
+        resolved_keys = gone
 
     weak_zones, invalid_zones = [], []
+    seen_zone = set()
     for z in zones:
-        name = VIEW_KR.get(z.get("viewType"), z.get("viewType", "알 수 없는 구역"))
-        if not z.get("zoneValid", True):
-            invalid_zones.append(name)
-        elif z.get("zoneScore", 100.0) < WEAK_ZONE_THRESHOLD:
+        vt = z.get("viewType")
+        name = VIEW_KR.get(vt, vt or "알 수 없는 구역")
+        sc = z.get("zoneScore")
+        if sc is None or not z.get("zoneValid", True):
+            if name not in invalid_zones and vt not in seen_zone:
+                invalid_zones.append(name)
+        elif sc < WEAK_ZONE_THRESHOLD and name not in weak_zones:
             weak_zones.append(name)
+        if sc is not None:
+            seen_zone.add(vt)
+    # 같은 구역이 한 광원에서는 유효, 다른 광원에서는 무효면 유효 쪽을 따른다
+    invalid_zones = [n for n in invalid_zones
+                     if not any(VIEW_KR.get(v, v) == n for v in seen_zone)]
 
     return {
         "issues": issues,
         "issue_cnt": len(issues),
         "has_issue": len(issues) > 0,
+        "has_prev": prev_map is not None,
         "has_calculus": any(i["lesion"] == "CALCULUS" for i in issues),
         "has_plaque": any(i["lesion"] == "PLAQUE" for i in issues),
         "molar_cnt": sum(1 for i in issues if is_molar(i["tooth"])),
@@ -699,6 +784,7 @@ def aggregate_session(teeth, zones=None, prev_issue_set=None) -> dict:
             for i in issues),
         "top_risk": issues[0]["riskLevel"] if issues else None,
         "resolved": resolved,
+        "resolved_keys": resolved_keys,
         "weak_zones": weak_zones,
         "invalid_zones": invalid_zones,
     }
@@ -1085,6 +1171,621 @@ def build_healthy_report(s: dict, picked: list):
         "management": build_management(s, picked),
         "disclaimer": DISCLAIMER,
     }
+    notice = build_notice(s)
+    if notice:
+        report["notice"] = notice
+    return report
+
+
+# ══════════════════════════════════════════════════════════════
+# ─────────────────────  v2: 점수 분해 + 해석  ─────────────────────
+#
+# 리포트 하단 2카드("N점은 이렇게 나왔어요", "지금 할 일") 용.
+#
+# 역할 분담:
+#   코드   : 감점 분해(치석/치태), 회복 가능 점수, 상한, reason code, 할 일 선택·순서·부위 바인딩
+#   LLM    : interpretation 3문장 — 감점의 성격 / 이전 대비 해석 / 다음 촬영에서 기대할 것
+#            숫자는 입력에 있는 것만, 관리 동작 지시는 금지 (actions 가 담당)
+#   폴백   : LLM 실패 시 코드가 같은 자리에 들어갈 3문장을 만든다 → 시연 중 빈 칸 없음
+#
+# 점수 공식은 Spring ScoreCalculator v2.3 을 그대로 옮긴 것이다:
+#   치아  = 100 − DAMAGE_K × 면적비(%)
+#   구역(병변별) = DETECTED 치아 점수 평균           ← AI 서버가 계산해 zones 행으로 옴
+#   구역 합성   = 100 − [1.0×(100−치석구역) + 0.6×(100−치태구역)]
+#   종합        = 유효 구역 합성 점수의 단순 평균
+# 전부 선형이라 종합 감점 = mean(치석 감점) + mean(치태 감점) 으로 정확히 쪼개진다.
+# Spring 이 totalScore 를 같이 보내면 재계산값과 대조해 어긋나면 경고를 찍는다.
+# ══════════════════════════════════════════════════════════════
+import json as _json
+
+DAMAGE_K = 3.0
+CALCULUS_SEVERITY_WEIGHT = 1.0
+PLAQUE_SEVERITY_WEIGHT = 0.6
+SCORE_MISMATCH_TOLERANCE = 0.6        # 반올림 차이 이상이면 경고
+LOW_COVERAGE_MAX_ZONES = 6            # 이 이하로 찍었으면 재촬영 권유를 반드시 넣는다
+RECAPTURE_SOFT_MAX_ZONES = 9          # 이 이하면 자리가 남을 때 재촬영 권유
+MAX_ACTIONS = 3
+PLAQUE_ACTION_MIN_POINTS = 1.0
+INTERP_SENTENCES = 3
+INTERP_MIN_LEN = 14
+INTERP_MAX_LEN = 120          # 항목(1~2문장) 길이 상한
+INTERP_MAX_SENTENCES = 2
+
+
+def _num(x) -> str:
+    """40.0 → '40', 12.7 → '12.7'. 문장에 숫자를 넣을 때 쓴다."""
+    if x is None:
+        return "?"
+    r = round(float(x), 1)
+    return str(int(r)) if r == int(r) else f"{r:.1f}"
+
+
+def _zone_lesion(z: dict) -> str:
+    """zones 행이 치석(백색광) 행인지 치태(UV) 행인지.
+    lightType 이 오면 그걸 쓰고(Spring measuredLesionType 과 동일 규칙),
+    없으면 어느 비율이 null 인지로 추정한다. 둘 다 값이 있으면(구형 테스트) 치석 행으로 본다."""
+    lt = str(z.get("lightType") or "").upper()
+    if lt:
+        return "PLAQUE" if "UV" in lt else "CALCULUS"
+    if z.get("totalCalculusRatio") is None and z.get("totalPlaqueRatio") is not None:
+        return "PLAQUE"
+    return "CALCULUS"
+
+
+def combine_zone_scores(zones) -> dict:
+    """Spring ScoreCalculator.combineZoneScore 와 같은 규칙으로 구역별 합성 점수와 감점을 낸다.
+    반환: {viewType: {score, calculusDeduction, plaqueDeduction, calculusZoneScore, plaqueZoneScore,
+                      detectedToothCount}}  — zoneScore 가 None 인 행은 Spring 처럼 제외."""
+    by_zone = {}
+    for z in zones or []:
+        vt, sc = z.get("viewType"), z.get("zoneScore")
+        if vt is None or sc is None:
+            continue
+        d = by_zone.setdefault(vt, {"calculus": None, "plaque": None, "detected": 0})
+        key = "plaque" if _zone_lesion(z) == "PLAQUE" else "calculus"
+        d[key] = float(sc) if d[key] is None else min(d[key], float(sc))   # Spring: Math::min
+        d["detected"] = max(d["detected"], int(z.get("detectedToothCount") or 0))
+    out = {}
+    for vt, d in by_zone.items():
+        d_calc = CALCULUS_SEVERITY_WEIGHT * (100.0 - d["calculus"]) if d["calculus"] is not None else 0.0
+        d_plq = PLAQUE_SEVERITY_WEIGHT * (100.0 - d["plaque"]) if d["plaque"] is not None else 0.0
+        out[vt] = {
+            "viewType": vt,
+            "name": VIEW_KR.get(vt, vt),
+            "score": round(max(0.0, 100.0 - d_calc - d_plq), 1),
+            "calculusDeduction": round(d_calc, 1),
+            "plaqueDeduction": round(d_plq, 1),
+            "calculusZoneScore": d["calculus"],
+            "plaqueZoneScore": d["plaque"],
+            "detectedToothCount": d["detected"],
+        }
+    return out
+
+
+def _session_from_zones(zones):
+    cz = combine_zone_scores(zones)
+    valid = list(cz.values())
+    if not valid:
+        return cz, None, 0.0, 0.0
+    n = len(valid)
+    total = round(sum(v["score"] for v in valid) / n, 1)
+    calc = sum(v["calculusDeduction"] for v in valid) / n
+    plq = sum(v["plaqueDeduction"] for v in valid) / n
+    return cz, total, calc, plq
+
+
+def compute_score(zones, prev_zones=None, total_score=None, prev_total_score=None,
+                  captured_zone_count=None, total_zone_count=None) -> dict:
+    """세션 점수와 감점 분해. Spring 이 준 totalScore 가 있으면 그걸 표시값으로 쓰고
+    감점 분해는 그 합이 100−total 이 되도록 비례 보정한다 (클램프·반올림 차이 흡수)."""
+    cz, mean_total, calc, plq = _session_from_zones(zones)
+    mismatch = None
+    if total_score is not None and mean_total is not None \
+            and abs(float(total_score) - mean_total) > SCORE_MISMATCH_TOLERANCE:
+        mismatch = {"spring": float(total_score), "recomputed": mean_total}
+        print(f"[SCORE] 종합 점수 불일치: Spring={total_score} 재계산={mean_total} "
+              f"→ Spring 값을 표시하고 감점은 비례 보정")
+    total = float(total_score) if total_score is not None else mean_total
+    if total is not None:
+        target = max(0.0, 100.0 - total)
+        s = calc + plq
+        if s > 0 and abs(s - target) > 0.05:
+            calc, plq = calc * target / s, plq * target / s
+    calc, plq = round(calc, 1), round(plq, 1)
+
+    prev = None
+    if prev_zones:
+        pcz, p_total, p_calc, p_plq = _session_from_zones(prev_zones)
+        if prev_total_score is not None:
+            p_total = float(prev_total_score)
+        if p_total is not None:
+            prev = {"total": round(p_total, 1), "calculusDeduction": round(p_calc, 1),
+                    "plaqueDeduction": round(p_plq, 1),
+                    "zones": {vt: v["score"] for vt, v in pcz.items()}}
+    elif prev_total_score is not None:
+        prev = {"total": round(float(prev_total_score), 1),
+                "calculusDeduction": None, "plaqueDeduction": None, "zones": {}}
+
+    captured = (int(captured_zone_count) if captured_zone_count is not None
+                else len({z.get("viewType") for z in (zones or []) if z.get("viewType")}))
+    total_zones = int(total_zone_count) if total_zone_count else TOTAL_ZONE_COUNT
+
+    zone_list = sorted(cz.values(), key=lambda v: v["score"])
+    worst = zone_list[0] if zone_list else None
+
+    missing_groups = []
+    if captured < total_zones:
+        captured_groups = {ZONE_GROUP.get(vt) for vt in cz}
+        for g in ("MOLAR", "PREMOLAR", "FRONT", "OUTER"):
+            if g not in captured_groups:
+                missing_groups.append(g)
+
+    return {
+        "total": round(total, 1) if total is not None else None,
+        "calculusDeduction": calc,
+        "plaqueDeduction": plq,
+        "totalDeduction": round(calc + plq, 1),
+        # 칫솔질로 되찾을 수 있는 점수 = 치태 감점. 치석 감점은 스케일링 뒤에만 열린다.
+        "recoverableByBrushing": plq,
+        "ceilingByBrushing": round(min(100.0, total + plq), 1) if total is not None else None,
+        "ceilingAfterScaling": round(min(100.0, total + calc), 1) if total is not None else None,
+        "delta": (round(total - prev["total"], 1) if (prev and total is not None) else None),
+        "prev": prev,
+        "capturedZoneCount": captured,
+        "totalZoneCount": total_zones,
+        "validZoneCount": len(cz),
+        "detectedToothCount": sum(v["detectedToothCount"] for v in cz.values()),
+        "zones": zone_list,
+        "worstZone": worst,
+        "missingGroups": missing_groups,
+        "mismatch": mismatch,
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+# 컨텍스트 — 집계(s) + 점수(score) 를 합쳐 reason code 와 LLM 입력을 만든다
+# ──────────────────────────────────────────────────────────────
+def _trend(items, resolved_cnt: int, has_prev: bool) -> str:
+    """병변 그룹의 추세. UNKNOWN / CLEARED / UP / DOWN / FLAT"""
+    if not has_prev:
+        return "UNKNOWN"
+    if not items:
+        return "CLEARED" if resolved_cnt else "NONE"
+    new = sum(1 for i in items if i["change"] == "NEW")
+    deltas = [i["delta_ratio"] for i in items if i["delta_ratio"] is not None]
+    mean_delta = sum(deltas) / len(deltas) if deltas else None
+    if new and new >= len(items) - new:
+        return "UP"
+    if mean_delta is not None and mean_delta <= -1.0:
+        return "DOWN"
+    if resolved_cnt and (mean_delta is None or mean_delta < 1.0):
+        return "DOWN"
+    if mean_delta is not None and mean_delta >= 1.0:
+        return "UP"
+    return "FLAT"
+
+
+def _group_ctx(items, resolved_cnt, has_prev):
+    regions = list(dict.fromkeys(i["region"] for i in items))
+    top = max(items, key=lambda i: i["ratio"]) if items else None
+    return {
+        "tooth_count": len(items),
+        "teeth": [i["tooth"] for i in items],
+        "regions": regions,
+        "regions_text": summarize_regions(regions) if regions else "",
+        "new_count": sum(1 for i in items if i["change"] == "NEW"),
+        "persisted_count": sum(1 for i in items if i["change"] == "PERSISTED"),
+        "resolved_count": resolved_cnt,
+        "anterior_count": sum(1 for i in items if not is_molar(i["tooth"])),
+        "molar_count": sum(1 for i in items if is_molar(i["tooth"])),
+        "max_ratio": top["ratio"] if top else 0.0,
+        "top_tooth": ({"fdi": top["tooth"], "region": top["region"], "ratio": top["ratio"],
+                       "prev_ratio": top["prev_ratio"]} if top else None),
+        "trend": _trend(items, resolved_cnt, has_prev),
+    }
+
+
+def build_context(s: dict, score: dict) -> dict:
+    calc_items = [i for i in s["issues"] if i["lesion"] == "CALCULUS"]
+    plq_items = [i for i in s["issues"] if i["lesion"] == "PLAQUE"]
+    res_calc = sum(1 for _, l in s.get("resolved_keys", []) if l == "CALCULUS")
+    res_plq = sum(1 for _, l in s.get("resolved_keys", []) if l == "PLAQUE")
+    calc = _group_ctx(calc_items, res_calc, s["has_prev"])
+    plq = _group_ctx(plq_items, res_plq, s["has_prev"])
+
+    # 1순위 reason code — '할 일' 1번과 해석 문장의 초점을 정한다
+    if not s["has_issue"]:
+        primary = "CLEAN"
+    elif s["has_calculus"]:
+        if s["has_prev"] and calc["new_count"] and calc["new_count"] >= calc["persisted_count"]:
+            primary = "NEW_CALCULUS"
+        elif s["has_prev"]:
+            primary = "PERSISTENT_CALCULUS"
+        else:
+            primary = "CALCULUS"
+    else:
+        primary = "PLAQUE_IMPROVING" if plq["trend"] == "DOWN" else "PLAQUE"
+
+    flags = []
+    if score["capturedZoneCount"] <= LOW_COVERAGE_MAX_ZONES:
+        flags.append("LOW_COVERAGE")
+    if score["delta"] is not None and score["delta"] > 0:
+        flags.append("IMPROVING")
+    if score["delta"] is not None and score["delta"] < 0:
+        flags.append("WORSENING")
+    if plq["trend"] in ("DOWN", "CLEARED"):
+        flags.append("PLAQUE_DOWN")
+    if s["has_calculus"] and s["has_plaque"]:
+        dominant = "CALCULUS" if score["calculusDeduction"] >= score["plaqueDeduction"] else "PLAQUE"
+    elif s["has_calculus"]:
+        dominant = "CALCULUS"
+    elif s["has_plaque"]:
+        dominant = "PLAQUE"
+    else:
+        dominant = None
+
+    return {"s": s, "score": score, "calculus": calc, "plaque": plq,
+            "primary": primary, "flags": flags, "dominant": dominant}
+
+
+# ──────────────────────────────────────────────────────────────
+# 할 일 — 코드가 고르고, 부위·수치를 끼워 넣는다. LLM 관여 없음.
+# 동사는 몇 개 안 되지만(스케일링/치실/치간칫솔/칫솔질/재촬영/유지)
+# 어떤 것이 몇 번째로, 어느 부위 때문에, 몇 점을 걸고 나오는지가 사람마다 다르다.
+# ──────────────────────────────────────────────────────────────
+def _pt_tag(points: float) -> str:
+    return f"+{_num(points)}점" if points and points >= 0.5 else "회복 가능"
+
+
+def build_actions(ctx: dict) -> list:
+    s, sc, calc, plq = ctx["s"], ctx["score"], ctx["calculus"], ctx["plaque"]
+    acts = []
+
+    if s["has_calculus"]:
+        n = calc["tooth_count"]
+        where = f'{calc["regions_text"]} {n}곳.'
+        if ctx["primary"] == "NEW_CALCULUS":
+            why = "지난 촬영엔 없던 치석이라 더 굳기 전에 받는 게 좋아요."
+        elif ctx["primary"] == "PERSISTENT_CALCULUS":
+            why = "지난 촬영에도 있던 자리라 칫솔질로는 줄지 않아요."
+        else:
+            why = "굳은 치석은 칫솔질로 떨어지지 않아요."
+        acts.append({"code": "SCALING", "title": "치과 스케일링 예약",
+                     "detail": f"{where} {why}", "tag": _pt_tag(sc["calculusDeduction"]),
+                     "points": sc["calculusDeduction"], "order": 0})
+
+    # 치태 감점이 1점도 안 되고 치석이 있으면 칫솔질 항목은 뺀다 — 자리는 치실/재촬영에 준다.
+    # (해석 문장이 "치태는 거의 없다"를 이미 말한다)
+    if s["has_plaque"] and (sc["plaqueDeduction"] >= PLAQUE_ACTION_MIN_POINTS or not s["has_calculus"]):
+        n = plq["tooth_count"]
+        if plq["trend"] == "DOWN":
+            acts.append({"code": "BRUSHING_KEEP", "title": "지금 칫솔질 유지",
+                         "detail": f'치태가 지난 촬영보다 줄었어요. {plq["regions_text"]}까지 같은 방식으로 이어 주세요.',
+                         "tag": _pt_tag(sc["plaqueDeduction"]), "points": sc["plaqueDeduction"], "order": 1})
+        else:
+            inner = any(r.endswith("앞니") and i // 10 in (3, 4)
+                        for r, i in zip(plq["regions"], plq["teeth"]))
+            tip = ("칫솔을 세워 안쪽 면을 위아래로 쓸어 주세요." if inner
+                   else "칫솔모를 잇몸 경계에 45도로 대고 짧게 움직여 주세요.")
+            acts.append({"code": "BRUSHING_METHOD", "title": "잇몸 경계 칫솔질",
+                         "detail": f'{plq["regions_text"]} {n}곳에 치태가 남아 있어요. {tip}',
+                         "tag": _pt_tag(sc["plaqueDeduction"]), "points": sc["plaqueDeduction"], "order": 1})
+
+    # 치아 사이 — 앞니면 치실, 어금니면 치간칫솔. 둘 다면 치아 수 많은 쪽.
+    if s["has_issue"]:
+        ant = calc["anterior_count"] + plq["anterior_count"]
+        mol = calc["molar_count"] + plq["molar_count"]
+        if ant or mol:
+            use_floss = ant >= mol
+            items = [i for i in s["issues"] if (not is_molar(i["tooth"])) == use_floss]
+            regions = summarize_regions(list(dict.fromkeys(i["region"] for i in items)))
+            if s["has_calculus"]:
+                tag, pts, why = "재발 방지", 0.0, "스케일링 뒤 같은 자리에 다시 생기는 걸 막아요."
+            else:
+                tag, pts, why = "보조", 0.0, "하루 한 번이면 충분해요."
+            if use_floss:
+                acts.append({"code": "FLOSS", "title": "치아 사이 치실",
+                             "detail": f"{regions}는 치아 사이가 좁아 칫솔모가 못 들어가요. {why}",
+                             "tag": tag, "points": pts, "order": 2})
+            else:
+                acts.append({"code": "INTERDENTAL_BRUSH", "title": "어금니 사이 치간칫솔",
+                             "detail": f"{regions} 사이는 칫솔모가 안 닿아요. 가장 가는 것부터 넣어 앞뒤로 움직이면 돼요. {why}",
+                             "tag": tag, "points": pts, "order": 2})
+
+    if sc["missingGroups"] and sc["capturedZoneCount"] < sc["totalZoneCount"]:
+        g = "MOLAR" if "MOLAR" in sc["missingGroups"] else sc["missingGroups"][0]
+        acts.append({"code": "RECAPTURE", "title": f"다음엔 {ZONE_GROUP_KR[g]}도 촬영",
+                     "detail": (f'이번 점수는 {sc["capturedZoneCount"]}구역 기준이에요. '
+                                f'{ZONE_GROUP_KR[g]}은 {ZONE_GROUP_WHY[g]}라 찍어야 전체 점수가 돼요.'),
+                     "tag": f'{sc["capturedZoneCount"]} → {sc["totalZoneCount"]}구역', "points": 0.0,
+                     "order": 3 if "LOW_COVERAGE" not in ctx["flags"] else 1.5})
+
+    if not s["has_issue"]:
+        if s["resolved"]:
+            d = f'지난번 보였던 {", ".join(s["resolved"][:2])}도 사라졌어요. 3개월 뒤 다시 촬영해 비교해 보세요.'
+        else:
+            d = "치석·치태가 보이지 않아요. 3개월 뒤 다시 촬영해 비교해 보세요."
+        acts.append({"code": "MAINTAIN", "title": "지금 습관 유지", "detail": d,
+                     "tag": "유지", "points": 0.0, "order": 0})
+
+    # 걸린 점수 순 → 같은 점수면 카탈로그 순서. LOW_COVERAGE 면 재촬영이 2번으로 올라온다.
+    acts.sort(key=lambda a: (-a["points"], a["order"]))
+    out = []
+    for a in acts[:MAX_ACTIONS]:
+        out.append({k: v for k, v in a.items() if k != "order"})
+    return out
+
+
+# ──────────────────────────────────────────────────────────────
+# LLM 입력 / 프롬프트
+# ──────────────────────────────────────────────────────────────
+def build_llm_input(ctx: dict, actions: list) -> dict:
+    s, sc, calc, plq = ctx["s"], ctx["score"], ctx["calculus"], ctx["plaque"]
+    prev = sc["prev"] or {}
+
+    def grp(g):
+        return {
+            "tooth_count": g["tooth_count"],
+            "regions": g["regions"],
+            "new_count": g["new_count"] if s["has_prev"] else None,
+            "persisted_count": g["persisted_count"] if s["has_prev"] else None,
+            "resolved_count": g["resolved_count"] if s["has_prev"] else None,
+            "max_ratio_pct": g["max_ratio"],
+            "top_tooth": g["top_tooth"],
+            "trend": g["trend"],
+        }
+
+    return {
+        "score": {
+            "total": sc["total"],
+            "prev_total": prev.get("total"),
+            "delta": sc["delta"],
+            "deduction": {"calculus": sc["calculusDeduction"], "plaque": sc["plaqueDeduction"],
+                          "total": sc["totalDeduction"]},
+            "prev_deduction": ({"calculus": prev.get("calculusDeduction"), "plaque": prev.get("plaqueDeduction")}
+                               if prev.get("calculusDeduction") is not None else None),
+            "recoverable_by_brushing": sc["recoverableByBrushing"],
+            "ceiling_by_brushing": sc["ceilingByBrushing"],
+            "ceiling_after_scaling": sc["ceilingAfterScaling"],
+            "worst_zone": ({"name": sc["worstZone"]["name"], "score": sc["worstZone"]["score"]}
+                           if sc["worstZone"] else None),
+        },
+        "coverage": {"captured_zones": sc["capturedZoneCount"], "total_zones": sc["totalZoneCount"],
+                     "missing_groups": [ZONE_GROUP_KR[g] for g in sc["missingGroups"]]},
+        "calculus": grp(calc),
+        "plaque": grp(plq),
+        "dominant": ctx["dominant"],
+        "primary_reason": ctx["primary"],
+        "flags": ctx["flags"],
+        "actions_shown_to_user": [a["title"] for a in actions],
+    }
+
+
+INTERP_SYSTEM_PROMPT = """당신은 구강 관리 앱의 리포트를 쓰는 치과위생사입니다.
+앱은 점수와 감점 분해(치석/치태), 그리고 '지금 할 일' 목록을 이미 화면에 보여줍니다.
+당신은 그 숫자들이 이 사용자에게 무슨 뜻인지 해석하는 3문장만 씁니다.
+
+[출력 형식 — 가장 중요]
+- 오직 JSON 객체 하나만 출력합니다: {"interpretation": ["문장1", "문장2", "문장3"]}
+- 코드블록, 마크다운, 번호, 인사말, 설명을 붙이지 않습니다. JSON 뒤에 즉시 멈춥니다.
+
+[세 문장의 역할 — 순서 고정]
+1. 감점의 성격: 감점이 치석과 치태 중 어디서 왔고, 그중 어느 부분이 칫솔질로 되돌아오는 점수이고 어느 부분은 아닌지.
+2. 이전 촬영과 비교한 해석: 점수가 왜 움직였는지, 또는 (이전 촬영이 없으면) 지금 상태에서 가장 눈에 띄는 한 가지.
+   치태가 줄고 치석이 그대로면 "칫솔질은 효과가 있고 남은 건 칫솔로 되는 영역이 아니다" 같은 결론을 내립니다.
+3. 다음 촬영에서 기대할 수 있는 것: 칫솔질만으로 닿을 수 있는 점수와, 스케일링 뒤에 열리는 점수.
+
+[규칙]
+- 숫자는 입력 JSON 에 있는 값만 그대로 씁니다. 계산하거나 새 숫자를 만들지 않습니다. 소수점은 입력 그대로.
+- 관리 동작을 지시하지 않습니다. "~하세요", "~해 주세요", "~받으세요", "권장" 금지. 할 일은 앱이 따로 보여줍니다.
+- 등급(A~F), 위험도(HIGH 등), "관찰돼요/발견됐어요" 표현, 영어 단어를 쓰지 않습니다.
+- 다정한 해요체. 합쇼체("~입니다") 금지. 2인칭 호칭·인사말 금지.
+- 각 항목은 1~2문장, 110자 이내. 모든 문장은 "요."로 끝납니다.
+- "플라크" 대신 "치태", 굳은 것은 "치석".
+- 치석은 칫솔질로 없어지지 않는다는 사실을 거스르는 문장을 쓰지 않습니다."""
+
+
+def build_interp_prompt(llm_input: dict) -> str:
+    return (
+        "아래는 한 사용자의 이번 구강 스캔 점수 데이터입니다. 이 사용자에게 맞는 해석 3문장을 쓰세요.\n\n"
+        "[입력 JSON]\n"
+        + _json.dumps(llm_input, ensure_ascii=False, indent=1)
+        + '\n\n[출력 형식 — 이 형태 그대로, 다른 텍스트 없이]\n{"interpretation": ["첫 문장.", "둘째 문장.", "셋째 문장."]}'
+    )
+
+
+# ──────────────────────────────────────────────────────────────
+# 검증 — 숫자 화이트리스트가 핵심
+# ──────────────────────────────────────────────────────────────
+_NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+_IMPERATIVE_LEAK = re.compile(r"(하세요|해\s?주세요|주세요|받으세요|해\s?보세요|권장|권해요|챙기세요|신경\s?써)")
+_GRADE_LEAK = re.compile(r"([A-F]\s?등급|등급|CRITICAL|HIGH|MEDIUM|LOW)")
+_ENDING_OK = re.compile(r"(요|죠)[.!]?$")
+
+
+def _collect_numbers(obj, acc: set):
+    if isinstance(obj, bool):
+        return
+    if isinstance(obj, (int, float)):
+        v = round(abs(float(obj)), 1)   # 문장에는 부호 없이 쓰인다 (−7.4 → '7.4점 내려갔어요')
+        acc.add(v)
+        acc.add(float(round(v)))          # 12.7 → 13 도 허용 (반올림 표기)
+        acc.add(float(int(v)))            # 12.7 → 12 도 허용 (버림 표기)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _collect_numbers(v, acc)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            _collect_numbers(v, acc)
+    elif isinstance(obj, str):
+        for m in _NUM_RE.findall(obj):
+            acc.add(round(float(m), 1))
+
+
+def allowed_numbers(llm_input: dict) -> set:
+    acc = {0.0, 100.0, float(TOTAL_ZONE_COUNT)}
+    _collect_numbers(llm_input, acc)
+    return acc
+
+
+def validate_interpretation(sentences, llm_input: dict) -> dict:
+    """실패 항목 dict. 비어 있으면 통과."""
+    fails = {}
+    if not isinstance(sentences, list) or len(sentences) != INTERP_SENTENCES \
+            or not all(isinstance(x, str) for x in sentences):
+        return {"문장수_3개_아님": True}
+    allowed = allowed_numbers(llm_input)
+    joined = " ".join(sentences)
+    bad_nums = []
+    for m in _NUM_RE.findall(joined):
+        if round(float(m), 1) not in allowed:
+            bad_nums.append(m)
+    if bad_nums:
+        fails["입력에_없는_숫자"] = bad_nums
+    if any(len(x) < INTERP_MIN_LEN for x in sentences):
+        fails["문장_너무_짧음"] = True
+    if any(len(x) > INTERP_MAX_LEN for x in sentences):
+        fails["문장_너무_김"] = True
+    if any(not 1 <= len(split_sentences(x)) <= INTERP_MAX_SENTENCES for x in sentences):
+        fails["항목당_문장수_1~2_아님"] = True
+    if any(not _ENDING_OK.search(x.rstrip()) for x in sentences):
+        fails["해요체_아님"] = True
+    if _IMPERATIVE_LEAK.search(joined):
+        fails["관리_지시_누수"] = True
+    if _GRADE_LEAK.search(joined):
+        fails["등급_누수"] = True
+    if _OBSERVE_LEAK.search(joined):
+        fails["관찰서술_누수"] = True
+    if _LATIN_LEAK.search(joined):
+        fails["영문_누수"] = True
+    if _FORMAL_LEAK.search(joined):
+        fails["문체_이탈"] = True
+    if any(b in joined for b in BANNED_WORDS):
+        fails["금칙어"] = True
+    if "플라크" in joined:
+        fails["플라크"] = True
+    # 치석이 칫솔질로 없어진다는 뉘앙스
+    if re.search(r"치석[^.]{0,20}(칫솔|양치)[^.]{0,15}(줄|없어|떨어|회복|되찾)", joined):
+        fails["치석_칫솔질_오류"] = True
+    return fails
+
+
+def finalize_interpretation(sentences) -> list:
+    out = []
+    for x in sentences:
+        x = polish(x)
+        if x and not x.endswith((".", "!", "?")):
+            x += "."
+        out.append(x)
+    return out
+
+
+# ──────────────────────────────────────────────────────────────
+# 폴백 — LLM 없이도 같은 자리에 들어갈 3문장. 숫자·사실만, 톤은 LLM 과 맞춘다.
+# ──────────────────────────────────────────────────────────────
+def build_fallback_interpretation(ctx: dict) -> list:
+    s, sc, calc, plq = ctx["s"], ctx["score"], ctx["calculus"], ctx["plaque"]
+    total, cd, pd = sc["total"], sc["calculusDeduction"], sc["plaqueDeduction"]
+    ded = sc["totalDeduction"]
+
+    if not s["has_issue"]:
+        a = "이번 촬영에서는 치석도 치태도 보이지 않아요."
+        b = (f'지난번 보였던 {", ".join(s["resolved"][:2])}도 이번엔 사라졌어요.'
+             if s["resolved"] else
+             (f'{sc["capturedZoneCount"]}구역만 찍어서 아직 전체 점수는 아니에요.'
+              if sc["capturedZoneCount"] < sc["totalZoneCount"] else "지금 습관이 잘 맞고 있어요."))
+        c = "지금대로 유지하면 다음 촬영에서도 같은 결과를 기대할 수 있어요."
+        return [a, b, c]
+
+    # 1. 감점의 성격
+    if ctx["dominant"] == "CALCULUS":
+        a = (f"감점 {_num(ded)}점 중 {_num(cd)}점이 치석이에요. "
+             f"이건 칫솔질로 돌아오지 않는 점수예요.")
+    else:
+        a = (f"감점 {_num(ded)}점 중 {_num(pd)}점이 치태예요. "
+             f"이건 칫솔질로 되찾을 수 있는 점수예요.")
+
+    # 2. 이전 대비
+    if s["has_prev"] and sc["delta"] is not None:
+        d = sc["delta"]
+        if d < 0 and calc["new_count"]:
+            b = (f"지난 촬영보다 {_num(abs(d))}점 내려갔고, 치석 {calc['new_count']}곳이 새로 보여요.")
+        elif d < 0 and plq["trend"] == "UP":
+            b = f"지난 촬영보다 {_num(abs(d))}점 내려갔고, 내려간 건 대부분 치태가 늘어서예요."
+        elif d < 0:
+            b = f"지난 촬영보다 {_num(abs(d))}점 내려갔어요."
+        elif d > 0 and plq["trend"] in ("DOWN", "CLEARED"):
+            b = (f"지난 촬영보다 {_num(d)}점 올랐고, 오른 건 치태가 줄어서예요. "
+                 f"지금 칫솔질이 통하고 있어요.")
+        elif d > 0:
+            b = f"지난 촬영보다 {_num(d)}점 올랐어요."
+        else:
+            b = "지난 촬영과 점수가 같아요."
+        if plq["trend"] == "CLEARED":
+            b = b.rstrip(".") + f", 지난번 치태 {plq['resolved_count']}곳은 이번에 사라졌어요."
+    elif sc["worstZone"]:
+        b = f'{sc["worstZone"]["name"]}이 {_num(sc["worstZone"]["score"])}점으로 가장 낮아요.'
+    else:
+        b = "첫 촬영이라 아직 비교할 기록이 없어요."
+
+    # 3. 상한
+    if s["has_calculus"] and pd >= 0.5:
+        c = (f"다음 촬영에서 칫솔질로 올릴 수 있는 건 {_num(sc['ceilingByBrushing'])}점까지예요. "
+             f"스케일링 뒤에는 {_num(sc['ceilingAfterScaling'])}점까지 열려요.")
+    elif s["has_calculus"]:
+        c = (f"치태가 거의 없어서 칫솔질로 더 올릴 점수는 없어요. "
+             f"스케일링 뒤에는 {_num(sc['ceilingAfterScaling'])}점까지 열려요.")
+    else:
+        c = f"치태를 다 줄이면 {_num(sc['ceilingByBrushing'])}점까지 갈 수 있어요."
+    return finalize_interpretation([a, b, c])
+
+
+# ──────────────────────────────────────────────────────────────
+# 응답 조립
+# ──────────────────────────────────────────────────────────────
+def score_payload(ctx: dict) -> dict:
+    sc = ctx["score"]
+    return {
+        "total": sc["total"],
+        "prevTotal": sc["prev"]["total"] if sc["prev"] else None,
+        "delta": sc["delta"],
+        "calculusDeduction": sc["calculusDeduction"],
+        "plaqueDeduction": sc["plaqueDeduction"],
+        "totalDeduction": sc["totalDeduction"],
+        "recoverableByBrushing": sc["recoverableByBrushing"],
+        "ceilingByBrushing": sc["ceilingByBrushing"],
+        "ceilingAfterScaling": sc["ceilingAfterScaling"],
+        "calculusToothCount": ctx["calculus"]["tooth_count"],
+        "plaqueToothCount": ctx["plaque"]["tooth_count"],
+        "detectedToothCount": sc["detectedToothCount"],
+        "capturedZoneCount": sc["capturedZoneCount"],
+        "totalZoneCount": sc["totalZoneCount"],
+        "primaryReason": ctx["primary"],
+        "flags": ctx["flags"],
+        "formulaText": ("치아마다 100 − 3 × 병변 면적비로 점수를 매기고, 촬영한 치아를 평균했어요. "
+                        "치태 감점은 60%만 반영돼요."),
+        "zones": [{"viewType": z["viewType"], "name": z["name"], "score": z["score"],
+                   "calculusDeduction": z["calculusDeduction"], "plaqueDeduction": z["plaqueDeduction"]}
+                  for z in sc["zones"]],
+        "scoreMismatch": sc["mismatch"],
+    }
+
+
+def build_code_only_report(s: dict, picked: list) -> dict:
+    """LLM 문장 없이 riskDetail / management 를 만든다 (구형 섹션을 LLM 없이 유지할 때)."""
+    groups = group_by_lesion(s) if s["has_issue"] else []
+    risk_detail = []
+    for g in groups:
+        parts = [build_observation(g), build_persisted_note(g)]
+        risk_detail.append({"title": f'{g["lesion_kr"]} · 치아 {g["tooth_cnt"]}개',
+                            "detail": " ".join(p for p in parts if p).strip(),
+                            "riskLevel": g["riskLevel"]})
+    if risk_detail:
+        risk_detail[0]["detail"] = (risk_detail[0]["detail"] + " " + recheck_sentence(s)).strip()
+        rn = build_resolved_note(s)
+        if rn:
+            risk_detail[-1]["detail"] = (risk_detail[-1]["detail"] + " " + rn).strip()
+    report = {"riskDetail": risk_detail, "management": build_management(s, picked)}
     notice = build_notice(s)
     if notice:
         report["notice"] = notice
