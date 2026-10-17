@@ -40,7 +40,7 @@ from collections import Counter
 # ══════════════════════════════════════════════════════════════
 # 이 값을 고칠 때마다 올린다. /dev/reload 와 /health 응답에 그대로 나와서
 # 콜랩에 올린 파일이 실제로 반영됐는지 바로 확인할 수 있다.
-LOGIC_VERSION = "2026-10-17-score-v2.5"
+LOGIC_VERSION = "2026-10-17-score-v2.6"
 
 DISCLAIMER = ("HabiTooth의 분석 결과는 구강 상태 파악을 돕는 보조 진단 및 참고 목적으로만 제공되며, "
               "전문적인 의료 자문, 확진 및 치료를 대신하지 않습니다. "
@@ -1614,6 +1614,9 @@ INTERP_SYSTEM_PROMPT = """당신은 구강 관리 앱의 리포트를 쓰는 치
    - new_count 가 0 이거나 null 이면 "새로", "생겼어요" 같은 말을 쓰지 않습니다. 지난 촬영에도 있던 것은 "그대로예요", "남아 있어요".
 3. 다음 촬영에서 기대할 수 있는 것: 칫솔질만으로 닿을 수 있는 점수(ceiling_by_brushing)와,
    스케일링 뒤에 돌아오는 점수(points_back_after_scaling). 값이 null 이면 그 부분은 아예 말하지 않습니다.
+   "N점까지" 에는 ceiling_by_brushing 값만 씁니다. "N점이 돌아와요" 에는 points_back_after_scaling 값만 씁니다.
+   recoverable_by_brushing(되찾는 점수)을 "까지"와 함께 쓰지 않습니다. 예: 상한 94, 되찾는 점수 10 이면
+   "94점까지 올릴 수 있어요"(O), "10점까지 올릴 수 있어요"(X).
    치석이 없는 사용자(points_back_after_scaling 이 null)에게는 "스케일링"이라는 말을 쓰지 않습니다.
 
 [규칙]
@@ -1721,6 +1724,13 @@ def validate_interpretation(sentences, llm_input: dict) -> dict:
         fails["문어체"] = True
     if llm_input.get("score", {}).get("points_back_after_scaling") is None and "스케일링" in joined:
         fails["치석_없는데_스케일링_언급"] = True
+    # "N점까지"는 상한이므로 현재 점수보다 작을 수 없다 ("10점까지 올릴 수 있어요" 같은 오류)
+    total = llm_input.get("score", {}).get("total")
+    if total is not None:
+        for m in re.finditer(r"(\d+(?:\.\d+)?)\s*점\s*까지", joined):
+            if float(m.group(1)) < float(total):
+                fails["상한_오류"] = m.group(1)
+                break
     # 새로 생긴 병변이 없는데 "새로/생겼" 이라고 쓰는 경우
     new_cnt = (llm_input.get("calculus", {}).get("new_count") or 0) + (llm_input.get("plaque", {}).get("new_count") or 0)
     if new_cnt == 0 and llm_input.get("score", {}).get("prev_total") is not None \
