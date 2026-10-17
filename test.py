@@ -279,7 +279,7 @@ def run_interpretation(ctx: dict, actions: list, max_retry: int = MAX_RETRY):
     user_prompt = report_logic.build_interp_prompt(llm_input)
     for i in range(max_retry):
         greedy = (i == max_retry - 1)
-        temperature, top_p = (0.0, 1.0) if greedy else (0.5, 0.9)
+        temperature, top_p = (0.0, 1.0) if greedy else (0.35, 0.9)
         t0 = time.time()
         print(f"[INTERP] 시도 {i+1}/{max_retry} (temp={temperature})")
         try:

@@ -40,7 +40,7 @@ from collections import Counter
 # ══════════════════════════════════════════════════════════════
 # 이 값을 고칠 때마다 올린다. /dev/reload 와 /health 응답에 그대로 나와서
 # 콜랩에 올린 파일이 실제로 반영됐는지 바로 확인할 수 있다.
-LOGIC_VERSION = "2026-10-17-score-v2.1"
+LOGIC_VERSION = "2026-10-17-score-v2.3"
 
 DISCLAIMER = ("HabiTooth의 분석 결과는 구강 상태 파악을 돕는 보조 진단 및 참고 목적으로만 제공되며, "
               "전문적인 의료 자문, 확진 및 치료를 대신하지 않습니다. "
@@ -1204,10 +1204,12 @@ DAMAGE_K = 3.0
 CALCULUS_SEVERITY_WEIGHT = 1.0
 PLAQUE_SEVERITY_WEIGHT = 0.6
 SCORE_MISMATCH_TOLERANCE = 0.6        # 반올림 차이 이상이면 경고
+INTEGER_POINTS = True                 # 앱이 점수를 정수로 보여주므로 리포트의 점수·감점도 정수로 맞춘다
 LOW_COVERAGE_MAX_ZONES = 6            # 이 이하로 찍었으면 재촬영 권유를 반드시 넣는다
 RECAPTURE_SOFT_MAX_ZONES = 9          # 이 이하면 자리가 남을 때 재촬영 권유
 MAX_ACTIONS = 3
-PLAQUE_ACTION_MIN_POINTS = 1.0
+MIN_MEANINGFUL_POINTS = 2             # 이 미만의 감점은 '거의 없음'으로 취급 (할 일·해석·폴백 공통)
+PLAQUE_ACTION_MIN_POINTS = MIN_MEANINGFUL_POINTS
 INTERP_SENTENCES = 3
 INTERP_MIN_LEN = 14
 INTERP_MAX_LEN = 120          # 항목(1~2문장) 길이 상한
@@ -1312,6 +1314,23 @@ def compute_score(zones, prev_zones=None, total_score=None, prev_total_score=Non
                 else len({z.get("viewType") for z in (zones or []) if z.get("viewType")}))
     total_zones = int(total_zone_count) if total_zone_count else TOTAL_ZONE_COUNT
 
+    # ── 정수화. 감점 합이 100 − 종합 과 정확히 맞도록 치태 쪽에서 나머지를 흡수한다.
+    raw = {"total": total, "calculusDeduction": calc, "plaqueDeduction": plq}
+    if INTEGER_POINTS and total is not None:
+        total = int(round(total))
+        calc = int(round(calc))
+        plq = max(0, (100 - total) - calc)
+        if prev:
+            prev["total"] = int(round(prev["total"]))
+            if prev["calculusDeduction"] is not None:
+                prev["calculusDeduction"] = int(round(prev["calculusDeduction"]))
+                prev["plaqueDeduction"] = max(0, (100 - prev["total"]) - prev["calculusDeduction"])
+            prev["zones"] = {k: int(round(v)) for k, v in prev["zones"].items()}
+        for v in cz.values():
+            v["score"] = int(round(v["score"]))
+            v["calculusDeduction"] = int(round(v["calculusDeduction"]))
+            v["plaqueDeduction"] = max(0, (100 - v["score"]) - v["calculusDeduction"])
+
     zone_list = sorted(cz.values(), key=lambda v: v["score"])
     worst = zone_list[0] if zone_list else None
 
@@ -1322,17 +1341,19 @@ def compute_score(zones, prev_zones=None, total_score=None, prev_total_score=Non
             if g not in captured_groups:
                 missing_groups.append(g)
 
+    r1 = (lambda x: x) if INTEGER_POINTS else (lambda x: round(x, 1))
     return {
-        "total": round(total, 1) if total is not None else None,
-        "calculusDeduction": calc,
-        "plaqueDeduction": plq,
-        "totalDeduction": round(calc + plq, 1),
+        "total": r1(total) if total is not None else None,
+        "calculusDeduction": r1(calc),
+        "plaqueDeduction": r1(plq),
+        "totalDeduction": r1(calc + plq),
         # 칫솔질로 되찾을 수 있는 점수 = 치태 감점. 치석 감점은 스케일링 뒤에만 열린다.
-        "recoverableByBrushing": plq,
-        "ceilingByBrushing": round(min(100.0, total + plq), 1) if total is not None else None,
-        "ceilingAfterScaling": round(min(100.0, total + calc), 1) if total is not None else None,
-        "delta": (round(total - prev["total"], 1) if (prev and total is not None) else None),
+        "recoverableByBrushing": r1(plq),
+        "ceilingByBrushing": r1(min(100, total + plq)) if total is not None else None,
+        "ceilingAfterScaling": r1(min(100, total + calc)) if total is not None else None,
+        "delta": (r1(total - prev["total"]) if (prev and total is not None) else None),
         "prev": prev,
+        "raw": raw,
         "capturedZoneCount": captured,
         "totalZoneCount": total_zones,
         "validZoneCount": len(cz),
@@ -1447,7 +1468,7 @@ def build_context(s: dict, score: dict) -> dict:
 # 어떤 것이 몇 번째로, 어느 부위 때문에, 몇 점을 걸고 나오는지가 사람마다 다르다.
 # ──────────────────────────────────────────────────────────────
 def _pt_tag(points: float) -> str:
-    return f"+{_num(points)}점" if points and points >= 0.5 else "회복 가능"
+    return f"+{_num(points)}점" if points and points >= 1 else "회복 가능"
 
 
 def build_actions(ctx: dict) -> list:
@@ -1557,9 +1578,11 @@ def build_llm_input(ctx: dict, actions: list) -> dict:
                           "total": sc["totalDeduction"]},
             "prev_deduction": ({"calculus": prev.get("calculusDeduction"), "plaque": prev.get("plaqueDeduction")}
                                if prev.get("calculusDeduction") is not None else None),
-            "recoverable_by_brushing": sc["recoverableByBrushing"],
-            "ceiling_by_brushing": sc["ceilingByBrushing"],
-            "ceiling_after_scaling": sc["ceilingAfterScaling"],
+            # 칫솔질로 되찾는 점수(치태 감점) / 그때 닿는 점수. 치태가 거의 없으면 None.
+            "recoverable_by_brushing": sc["recoverableByBrushing"] if sc["plaqueDeduction"] >= MIN_MEANINGFUL_POINTS else None,
+            "ceiling_by_brushing": sc["ceilingByBrushing"] if sc["plaqueDeduction"] >= MIN_MEANINGFUL_POINTS else None,
+            # 스케일링 뒤에 돌아오는 점수(치석 감점). 치석이 없으면 None → 스케일링 언급 금지.
+            "points_back_after_scaling": sc["calculusDeduction"] if sc["calculusDeduction"] >= MIN_MEANINGFUL_POINTS else None,
             "worst_zone": ({"name": sc["worstZone"]["name"], "score": sc["worstZone"]["score"]}
                            if sc["worstZone"] else None),
         },
@@ -1586,13 +1609,19 @@ INTERP_SYSTEM_PROMPT = """당신은 구강 관리 앱의 리포트를 쓰는 치
 1. 감점의 성격: 감점이 치석과 치태 중 어디서 왔고, 그중 어느 부분이 칫솔질로 되돌아오는 점수이고 어느 부분은 아닌지.
 2. 이전 촬영과 비교한 해석: 점수가 왜 움직였는지, 또는 (이전 촬영이 없으면) 지금 상태에서 가장 눈에 띄는 한 가지.
    치태가 줄고 치석이 그대로면 "칫솔질은 효과가 있고 남은 건 칫솔로 되는 영역이 아니다" 같은 결론을 내립니다.
-3. 다음 촬영에서 기대할 수 있는 것: 칫솔질만으로 닿을 수 있는 점수와, 스케일링 뒤에 열리는 점수.
+3. 다음 촬영에서 기대할 수 있는 것: 칫솔질만으로 닿을 수 있는 점수(ceiling_by_brushing)와,
+   스케일링 뒤에 돌아오는 점수(points_back_after_scaling). 값이 null 이면 그 부분은 아예 말하지 않습니다.
+   치석이 없는 사용자(points_back_after_scaling 이 null)에게는 "스케일링"이라는 말을 쓰지 않습니다.
 
 [규칙]
 - 숫자는 입력 JSON 에 있는 값만 그대로 씁니다. 계산하거나 새 숫자를 만들지 않습니다. 소수점은 입력 그대로.
+- 점수에는 반드시 "점"을 붙입니다: "12.3점", "87.6점까지". "포인트"는 쓰지 않습니다. 단위 없는 숫자는 쓰지 않습니다.
 - 관리 동작을 지시하지 않습니다. "~하세요", "~해 주세요", "~받으세요", "권장" 금지. 할 일은 앱이 따로 보여줍니다.
 - 등급(A~F), 위험도(HIGH 등), "관찰돼요/발견됐어요" 표현, 영어 단어를 쓰지 않습니다.
-- 다정한 해요체. 합쇼체("~입니다") 금지. 2인칭 호칭·인사말 금지.
+- 말투: 다정한 해요체로, 말하듯 짧게 끊습니다. 합쇼체("~입니다") 금지. 2인칭 호칭·인사말 금지.
+  "~하며", "~되며", "~으며" 같은 문어체 연결과 "발생했어요", "개선 가능해요", "기대돼요" 같은 보고서 표현을 쓰지 않습니다.
+  좋은 예: "감점 12.6점 중 12.3점이 치석이에요. 이건 칫솔질로 돌아오지 않는 점수예요."
+  나쁜 예: "감점은 치석 12.3점에서 발생했으며 칫솔질로 개선 가능해요."
 - 각 항목은 1~2문장, 110자 이내. 모든 문장은 "요."로 끝납니다.
 - "플라크" 대신 "치태", 굳은 것은 "치석".
 - 치석은 칫솔질로 없어지지 않는다는 사실을 거스르는 문장을 쓰지 않습니다."""
@@ -1614,6 +1643,10 @@ _NUM_RE = re.compile(r"\d+(?:\.\d+)?")
 _IMPERATIVE_LEAK = re.compile(r"(하세요|해\s?주세요|주세요|받으세요|해\s?보세요|권장|권해요|챙기세요|신경\s?써)")
 _GRADE_LEAK = re.compile(r"([A-F]\s?등급|등급|CRITICAL|HIGH|MEDIUM|LOW)")
 _ENDING_OK = re.compile(r"(요|죠)[.!]?$")
+# 숫자 뒤에 단위가 없는 경우 ("9.9까지", "3.9 올랐")
+_UNITLESS_NUM = re.compile(r"(?<![\d.])\d+(?:\.\d+)?(?![\d.])(?!\s*(?:점|곳|구역|개|%|번|회|주|개월|일))")
+# 문어체 연결·보고서 표현
+_WRITTEN_STYLE = re.compile(r"(으며|하며|되며|이며|발생했|개선 가능|기대돼요|기대됩니다|최고 점수|반영된 것으로)")
 
 
 def _collect_numbers(obj, acc: set):
@@ -1677,6 +1710,12 @@ def validate_interpretation(sentences, llm_input: dict) -> dict:
         fails["금칙어"] = True
     if "플라크" in joined:
         fails["플라크"] = True
+    if "포인트" in joined or _UNITLESS_NUM.search(joined):
+        fails["단위_누락"] = True
+    if _WRITTEN_STYLE.search(joined):
+        fails["문어체"] = True
+    if llm_input.get("score", {}).get("points_back_after_scaling") is None and "스케일링" in joined:
+        fails["치석_없는데_스케일링_언급"] = True
     # 치석이 칫솔질로 없어진다는 뉘앙스
     if re.search(r"치석[^.]{0,20}(칫솔|양치)[^.]{0,15}(줄|없어|떨어|회복|되찾)", joined):
         fails["치석_칫솔질_오류"] = True
@@ -1687,6 +1726,7 @@ def finalize_interpretation(sentences) -> list:
     out = []
     for x in sentences:
         x = polish(x)
+        x = re.sub(r"(\d+(?:\.\d+)?)\s*포인트", r"\1점", x)
         if x and not x.endswith((".", "!", "?")):
             x += "."
         out.append(x)
@@ -1742,12 +1782,12 @@ def build_fallback_interpretation(ctx: dict) -> list:
         b = "첫 촬영이라 아직 비교할 기록이 없어요."
 
     # 3. 상한
-    if s["has_calculus"] and pd >= 0.5:
+    if cd >= MIN_MEANINGFUL_POINTS and pd >= MIN_MEANINGFUL_POINTS:
         c = (f"다음 촬영에서 칫솔질로 올릴 수 있는 건 {_num(sc['ceilingByBrushing'])}점까지예요. "
-             f"스케일링 뒤에는 {_num(sc['ceilingAfterScaling'])}점까지 열려요.")
-    elif s["has_calculus"]:
+             f"치석 감점 {_num(cd)}점은 스케일링 뒤에 돌아와요.")
+    elif cd >= MIN_MEANINGFUL_POINTS:
         c = (f"치태가 거의 없어서 칫솔질로 더 올릴 점수는 없어요. "
-             f"스케일링 뒤에는 {_num(sc['ceilingAfterScaling'])}점까지 열려요.")
+             f"치석 감점 {_num(cd)}점은 스케일링 뒤에 돌아와요.")
     else:
         c = f"치태를 다 줄이면 {_num(sc['ceilingByBrushing'])}점까지 갈 수 있어요."
     return finalize_interpretation([a, b, c])
