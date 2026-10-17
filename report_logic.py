@@ -40,7 +40,7 @@ from collections import Counter
 # ══════════════════════════════════════════════════════════════
 # 이 값을 고칠 때마다 올린다. /dev/reload 와 /health 응답에 그대로 나와서
 # 콜랩에 올린 파일이 실제로 반영됐는지 바로 확인할 수 있다.
-LOGIC_VERSION = "2026-10-17-score-v2.6"
+LOGIC_VERSION = "2026-10-17-score-v2.7"
 
 DISCLAIMER = ("HabiTooth의 분석 결과는 구강 상태 파악을 돕는 보조 진단 및 참고 목적으로만 제공되며, "
               "전문적인 의료 자문, 확진 및 치료를 대신하지 않습니다. "
@@ -1621,7 +1621,10 @@ INTERP_SYSTEM_PROMPT = """당신은 구강 관리 앱의 리포트를 쓰는 치
 
 [규칙]
 - 숫자는 입력 JSON 에 있는 값만 그대로 씁니다. 계산하거나 새 숫자를 만들지 않습니다. 소수점은 입력 그대로.
-- 점수에는 반드시 "점"을 붙입니다: "12.3점", "87.6점까지". "포인트"는 쓰지 않습니다. 단위 없는 숫자는 쓰지 않습니다.
+- 점수에는 반드시 "점"을 붙입니다: "12점", "88점까지". "포인트"는 쓰지 않습니다. 단위 없는 숫자는 쓰지 않습니다.
+- 면적비(ratio, %)는 점수가 아닙니다. ratio 값이나 ratio 의 차이를 "N점"으로 쓰지 않습니다.
+  prev_deduction 이 null 이면 치석·치태 각각이 몇 점 변했는지는 알 수 없는 것이므로 병변별 점수 변화량을 쓰지 않습니다.
+  그때는 방향만 씁니다: "치태가 늘었어요", "치석은 그대로예요".
 - 관리 동작을 지시하지 않습니다. "~하세요", "~해 주세요", "~받으세요", "권장" 금지. 할 일은 앱이 따로 보여줍니다.
 - 등급(A~F), 위험도(HIGH 등), "관찰돼요/발견됐어요" 표현, 영어 단어를 쓰지 않습니다.
 - 말투: 다정한 해요체로, 말하듯 짧게 끊습니다. 합쇼체("~입니다") 금지. 2인칭 호칭·인사말 금지.
@@ -1676,10 +1679,28 @@ def _collect_numbers(obj, acc: set):
             acc.add(round(float(m), 1))
 
 
+def _split_by_unit(obj, points: set, pcts: set, in_ratio=False):
+    """키 이름에 ratio 가 들어간 값은 면적비(%), 나머지는 점수·개수로 분류한다."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _split_by_unit(v, points, pcts, in_ratio or ("ratio" in str(k).lower()))
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            _split_by_unit(v, points, pcts, in_ratio)
+    else:
+        _collect_numbers(obj, pcts if in_ratio else points)
+
+
 def allowed_numbers(llm_input: dict) -> set:
     acc = {0.0, 100.0, float(TOTAL_ZONE_COUNT)}
     _collect_numbers(llm_input, acc)
     return acc
+
+
+def allowed_numbers_by_unit(llm_input: dict):
+    points, pcts = {0.0, 100.0, float(TOTAL_ZONE_COUNT)}, set()
+    _split_by_unit(llm_input, points, pcts)
+    return points, pcts
 
 
 def validate_interpretation(sentences, llm_input: dict) -> dict:
@@ -1689,6 +1710,7 @@ def validate_interpretation(sentences, llm_input: dict) -> dict:
             or not all(isinstance(x, str) for x in sentences):
         return {"문장수_3개_아님": True}
     allowed = allowed_numbers(llm_input)
+    points_ok, pcts_ok = allowed_numbers_by_unit(llm_input)
     joined = " ".join(sentences)
     bad_nums = []
     for m in _NUM_RE.findall(joined):
@@ -1696,6 +1718,16 @@ def validate_interpretation(sentences, llm_input: dict) -> dict:
             bad_nums.append(m)
     if bad_nums:
         fails["입력에_없는_숫자"] = bad_nums
+    # 단위별: "N점"은 점수 블록 숫자만, "N%"는 면적비 숫자만 (면적비 차이를 점으로 쓰는 오류 차단)
+    wrong_unit = []
+    for m in re.finditer(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(점|%)", joined):
+        v, u = round(float(m.group(1)), 1), m.group(2)
+        if u == "점" and v not in points_ok:
+            wrong_unit.append(m.group(0))
+        if u == "%" and v not in pcts_ok:
+            wrong_unit.append(m.group(0))
+    if wrong_unit:
+        fails["단위_불일치"] = wrong_unit
     if any(len(x) < INTERP_MIN_LEN for x in sentences):
         fails["문장_너무_짧음"] = True
     if any(len(x) > INTERP_MAX_LEN for x in sentences):
@@ -1724,6 +1756,9 @@ def validate_interpretation(sentences, llm_input: dict) -> dict:
         fails["문어체"] = True
     if llm_input.get("score", {}).get("points_back_after_scaling") is None and "스케일링" in joined:
         fails["치석_없는데_스케일링_언급"] = True
+    if llm_input.get("score", {}).get("points_back_after_scaling") is None \
+            and re.search(r"(돌아오지 않|되돌아오지 않|돌아오지 못|되돌릴 수 없|되찾을 수 없)", joined):
+        fails["치석_없는데_불가_언급"] = True
     # "N점까지"는 상한이므로 현재 점수보다 작을 수 없다 ("10점까지 올릴 수 있어요" 같은 오류)
     total = llm_input.get("score", {}).get("total")
     if total is not None:
