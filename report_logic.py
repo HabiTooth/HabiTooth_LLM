@@ -40,7 +40,7 @@ from collections import Counter
 # ══════════════════════════════════════════════════════════════
 # 이 값을 고칠 때마다 올린다. /dev/reload 와 /health 응답에 그대로 나와서
 # 콜랩에 올린 파일이 실제로 반영됐는지 바로 확인할 수 있다.
-LOGIC_VERSION = "2026-10-17-score-v2"
+LOGIC_VERSION = "2026-10-17-score-v2.1"
 
 DISCLAIMER = ("HabiTooth의 분석 결과는 구강 상태 파악을 돕는 보조 진단 및 참고 목적으로만 제공되며, "
               "전문적인 의료 자문, 확진 및 치료를 대신하지 않습니다. "
@@ -747,11 +747,12 @@ def aggregate_session(teeth, zones=None, prev_issue_set=None) -> dict:
                 cnt[it["lesion"]] = c + 1
         issues = kept
 
-    resolved, resolved_keys = [], []
+    resolved, resolved_keys, resolved_prev_ratio = [], [], {}
     if prev_issue_set is not None:
         gone = sorted(prev_issue_set - set(issue_map.keys()))
         resolved = [f"{fdi_to_region(t)} {LESION_KR.get(l, l)}" for t, l in gone]
         resolved_keys = gone
+        resolved_prev_ratio = [[t, l, prev_map[(t, l)]] for t, l in gone]   # JSON 직렬화 가능하게 리스트
 
     weak_zones, invalid_zones = [], []
     seen_zone = set()
@@ -785,6 +786,7 @@ def aggregate_session(teeth, zones=None, prev_issue_set=None) -> dict:
         "top_risk": issues[0]["riskLevel"] if issues else None,
         "resolved": resolved,
         "resolved_keys": resolved_keys,
+        "resolved_prev_ratio": resolved_prev_ratio,   # [[tooth, lesion, 이전 areaRatio|None], ...]
         "weak_zones": weak_zones,
         "invalid_zones": invalid_zones,
     }
@@ -1345,27 +1347,35 @@ def compute_score(zones, prev_zones=None, total_score=None, prev_total_score=Non
 # ──────────────────────────────────────────────────────────────
 # 컨텍스트 — 집계(s) + 점수(score) 를 합쳐 reason code 와 LLM 입력을 만든다
 # ──────────────────────────────────────────────────────────────
-def _trend(items, resolved_cnt: int, has_prev: bool) -> str:
-    """병변 그룹의 추세. UNKNOWN / CLEARED / UP / DOWN / FLAT"""
+def _trend(items, resolved_cnt: int, has_prev: bool, resolved_prev_ratios=None) -> str:
+    """병변 그룹의 추세. UNKNOWN / NONE / CLEARED / UP / DOWN / FLAT
+    이전 면적비를 알면 '양'(면적비 합)으로, 모르면(구형 prevTeeth) 치아 수로 판단한다."""
     if not has_prev:
         return "UNKNOWN"
     if not items:
         return "CLEARED" if resolved_cnt else "NONE"
-    new = sum(1 for i in items if i["change"] == "NEW")
-    deltas = [i["delta_ratio"] for i in items if i["delta_ratio"] is not None]
-    mean_delta = sum(deltas) / len(deltas) if deltas else None
-    if new and new >= len(items) - new:
+    persisted = [i for i in items if i["change"] == "PERSISTED"]
+    new = [i for i in items if i["change"] == "NEW"]
+    prev_known = all(i["prev_ratio"] is not None for i in persisted) and \
+        all(r is not None for r in (resolved_prev_ratios or {}).values())
+    if prev_known and (persisted or resolved_prev_ratios):
+        now_sum = sum(i["ratio"] for i in items)
+        prev_sum = sum(i["prev_ratio"] for i in persisted) + sum((resolved_prev_ratios or {}).values())
+        diff = now_sum - prev_sum
+        if diff <= -1.0:
+            return "DOWN"
+        if diff >= 1.0:
+            return "UP"
+        return "FLAT"
+    # 이전 비율 없음 → 개수 기준
+    if new and len(new) > len(persisted) + resolved_cnt:
         return "UP"
-    if mean_delta is not None and mean_delta <= -1.0:
+    if resolved_cnt > len(new):
         return "DOWN"
-    if resolved_cnt and (mean_delta is None or mean_delta < 1.0):
-        return "DOWN"
-    if mean_delta is not None and mean_delta >= 1.0:
-        return "UP"
     return "FLAT"
 
 
-def _group_ctx(items, resolved_cnt, has_prev):
+def _group_ctx(items, resolved_cnt, has_prev, resolved_prev_ratios=None):
     regions = list(dict.fromkeys(i["region"] for i in items))
     top = max(items, key=lambda i: i["ratio"]) if items else None
     return {
@@ -1381,7 +1391,7 @@ def _group_ctx(items, resolved_cnt, has_prev):
         "max_ratio": top["ratio"] if top else 0.0,
         "top_tooth": ({"fdi": top["tooth"], "region": top["region"], "ratio": top["ratio"],
                        "prev_ratio": top["prev_ratio"]} if top else None),
-        "trend": _trend(items, resolved_cnt, has_prev),
+        "trend": _trend(items, resolved_cnt, has_prev, resolved_prev_ratios),
     }
 
 
@@ -1390,8 +1400,11 @@ def build_context(s: dict, score: dict) -> dict:
     plq_items = [i for i in s["issues"] if i["lesion"] == "PLAQUE"]
     res_calc = sum(1 for _, l in s.get("resolved_keys", []) if l == "CALCULUS")
     res_plq = sum(1 for _, l in s.get("resolved_keys", []) if l == "PLAQUE")
-    calc = _group_ctx(calc_items, res_calc, s["has_prev"])
-    plq = _group_ctx(plq_items, res_plq, s["has_prev"])
+    rpr = s.get("resolved_prev_ratio", [])
+    calc = _group_ctx(calc_items, res_calc, s["has_prev"],
+                      {(t, l): r for t, l, r in rpr if l == "CALCULUS"})
+    plq = _group_ctx(plq_items, res_plq, s["has_prev"],
+                     {(t, l): r for t, l, r in rpr if l == "PLAQUE"})
 
     # 1순위 reason code — '할 일' 1번과 해석 문장의 초점을 정한다
     if not s["has_issue"]:
