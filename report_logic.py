@@ -462,7 +462,7 @@ REGION_HINT_PLAQUE = {
 MAX_HINTS_PER_GROUP = 3
 
 # 힌트를 그대로 베꼈는지 판정하는 기준. 공백·기호를 뗀 뒤 이만큼 연속 일치하면 베낌으로 본다.
-HINT_COPY_NGRAM = 8
+HINT_COPY_NGRAM = 11
 
 
 def select_management(s: dict, k: int = 3):
@@ -920,7 +920,7 @@ _FORMAL_LEAK = re.compile(r"니다|네요|군요|는군|랍니다|죠(?=[\s.,!?]
 
 # 첫 문장이 너무 짧으면 힌트를 제대로 풀어 쓰지 않은 것이다.
 #   예: "볼에 가려 칫솔이 닿기 어려운 곳이 많아요." (정보량 거의 없음)
-MIN_FIRST_SENTENCE_LEN = 28
+MIN_FIRST_SENTENCE_LEN = 24
 
 
 def _first_sentence_too_short(detail: str) -> bool:
