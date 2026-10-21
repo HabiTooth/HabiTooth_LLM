@@ -40,7 +40,7 @@ from collections import Counter
 # ══════════════════════════════════════════════════════════════
 # 이 값을 고칠 때마다 올린다. /dev/reload 와 /health 응답에 그대로 나와서
 # 콜랩에 올린 파일이 실제로 반영됐는지 바로 확인할 수 있다.
-LOGIC_VERSION = "2026-10-17-score-v2.8"
+LOGIC_VERSION = "2026-10-21-score-v2.9"
 
 DISCLAIMER = ("HabiTooth의 분석 결과는 구강 상태 파악을 돕는 보조 진단 및 참고 목적으로만 제공되며, "
               "전문적인 의료 자문, 확진 및 치료를 대신하지 않습니다. "
@@ -854,19 +854,43 @@ def build_persisted_note(g: dict) -> str:
     """
     if not g.get("has_prev"):
         return ""
-    p, n, total = g["persisted_cnt"], g["new_cnt"], g["tooth_cnt"]
+    # 관찰 문장(부위 나열)을 빼도 혼자 읽히도록 병변 이름을 주어로 둔다.
+    p, n, kr = g["persisted_cnt"], g["new_cnt"], g["lesion_kr"]
     if p == 0:
-        return "모두 지난번 측정에는 없던 자리예요."
+        return f"{kr}{_eun_neun(kr)} 모두 지난번 측정에는 없던 자리예요."
     if n == 0:
-        return "지난번 측정에도 있던 자리가 그대로 남아 있어요."
-    return f"이 중 치아 {p}개는 지난번 측정에도 있던 자리예요."
+        return f"{kr}{_eun_neun(kr)} 지난번 측정에도 있던 자리에 그대로 남아 있어요."
+    return f"{kr}{_particle(kr)} 보인 치아 중 {p}개는 지난번 측정에도 있던 자리예요."
+
+
+def summarize_resolved(s: dict) -> str:
+    """
+    사라진 병변을 병변별로 묶어 짧게 말한다.
+    s["resolved"] 는 치아 단위라 같은 부위가 반복된다
+    ("왼쪽 위 앞니 치태, 왼쪽 위 앞니 치태, ...").
+      - 한 부위에만 있었으면 부위 이름까지: "왼쪽 아래 앞니 치석 2곳"
+      - 여러 부위면 개수만:               "치태 15곳"
+    """
+    keys = s.get("resolved_keys") or []
+    parts = []
+    for lesion in ("CALCULUS", "PLAQUE"):
+        teeth = sorted({t for t, l in keys if l == lesion})
+        if not teeth:
+            continue
+        kr = LESION_KR[lesion]
+        regions = list(dict.fromkeys(fdi_to_region(t) for t in teeth))
+        if len(regions) == 1:
+            parts.append(f"{regions[0]} {kr}" + (f" {len(teeth)}곳" if len(teeth) > 1 else ""))
+        else:
+            parts.append(f"{kr} {len(teeth)}곳")
+    return ", ".join(parts)
 
 
 def build_resolved_note(s: dict) -> str:
-    """지난번에 있었지만 이번에 사라진 부위. 코드가 만든다."""
-    if not s["resolved"]:
+    """지난번에 있었지만 이번에 사라진 병변. 코드가 만든다."""
+    joined = summarize_resolved(s)
+    if not joined:
         return ""
-    joined = ", ".join(s["resolved"])
     return f'지난번에 보였던 {joined}{_eun_neun(joined)} 이번 측정에서 보이지 않아요.'
 
 
@@ -1074,8 +1098,10 @@ def assemble_report(s: dict, llm_out: dict, picked: list):
     risk_detail = []
     if s["has_issue"]:
         for g, sent in zip(groups, details):
-            # 관찰 → 이전 측정 대비 변화 → LLM 관리 문장
-            parts = [build_observation(g), build_persisted_note(g), sent]
+            # 이전 측정 대비 변화 → LLM 관리 문장.
+            # 관찰 문장(부위 나열)은 넣지 않는다. 3D 에서 치아를 고른 뒤 보이는 텍스트라
+            # 위치는 이미 화면에 있고, 병변 부위가 늘수록 문장만 길어진다.
+            parts = [build_persisted_note(g), sent]
             risk_detail.append({
                 "title": f'{g["lesion_kr"]} · 치아 {g["tooth_cnt"]}개',
                 "detail": " ".join(p for p in parts if p).strip(),
@@ -1161,7 +1187,7 @@ HEALTHY_RESOLVED = ("이번 측정에서는 치석이나 치태가 발견되지 
 
 def build_healthy_report(s: dict, picked: list):
     if s["resolved"]:
-        detail = HEALTHY_RESOLVED.format(resolved=", ".join(s["resolved"]))
+        detail = HEALTHY_RESOLVED.format(resolved=summarize_resolved(s))
     else:
         detail = HEALTHY_DETAIL
     report = {
@@ -1536,7 +1562,7 @@ def build_actions(ctx: dict) -> list:
 
     if not s["has_issue"]:
         if s["resolved"]:
-            d = f'지난번 보였던 {", ".join(s["resolved"][:2])}도 사라졌어요. 3개월 뒤 다시 촬영해 비교해 보세요.'
+            d = f'지난번 보였던 {summarize_resolved(s)}도 사라졌어요. 3개월 뒤 다시 촬영해 비교해 보세요.'
         else:
             d = "치석·치태가 보이지 않아요. 3개월 뒤 다시 촬영해 비교해 보세요."
         acts.append({"code": "MAINTAIN", "title": "지금 습관 유지", "detail": d,
@@ -1827,7 +1853,7 @@ def build_fallback_interpretation(ctx: dict) -> list:
 
     if not s["has_issue"]:
         a = "이번 촬영에서는 치석도 치태도 보이지 않아요."
-        b = (f'지난번 보였던 {", ".join(s["resolved"][:2])}도 이번엔 사라졌어요.'
+        b = (f'지난번 보였던 {summarize_resolved(s)}도 이번엔 사라졌어요.'
              if s["resolved"] else
              (f'{sc["capturedZoneCount"]}구역만 찍어서 아직 전체 점수는 아니에요.'
               if sc["capturedZoneCount"] < sc["totalZoneCount"] else "지금 습관이 잘 맞고 있어요."))
