@@ -326,6 +326,8 @@ def generate_llm_report(req: ReportRequest):
         print(f"[LLM] 병변 {s['issue_cnt']}건 / 점수 {score['total']} "
               f"(치석 -{score['calculusDeduction']} 치태 -{score['plaqueDeduction']}) "
               f"/ reason {ctx['primary']} {ctx['flags']} / 할 일 {[a['code'] for a in actions]}")
+        if score.get("mismatch"):
+            print(f"[LLM] ⚠ 점수 불일치 (Spring vs 재계산): {score['mismatch']}")
 
         # ── 구형 섹션 (riskDetail / management) — 앱이 새 UI 로 바뀔 때까지 유지
         if not s["has_issue"]:
@@ -374,7 +376,7 @@ def dev_dry_run(req: ReportRequest):
         "session": {k: v for k, v in s.items() if k != "issues"},
         "issues": s["issues"],
         "score": report_logic.score_payload(ctx),
-        "primary_reason": ctx["primary"], "flags": ctx["flags"],
+        "score_debug": report_logic.score_debug(ctx),     # 앱 응답엔 없는 필드 (reason·flags·zones·불일치 등)
         "actions": actions,
         "llm_input": llm_input,
         "interp_prompt": interp_prompt,

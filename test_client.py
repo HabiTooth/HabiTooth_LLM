@@ -250,9 +250,8 @@ def _print_v2(data: dict):
     print(f"\n[점수] {sc.get('total')} (지난 {sc.get('prevTotal')}, Δ{sc.get('delta')})  "
           f"감점 치석 {sc.get('calculusDeduction')} / 치태 {sc.get('plaqueDeduction')}  "
           f"상한 칫솔질 {sc.get('ceilingByBrushing')} / 스케일링 {sc.get('ceilingAfterScaling')}  "
-          f"촬영 {sc.get('capturedZoneCount')}/{sc.get('totalZoneCount')}  reason={sc.get('primaryReason')} {sc.get('flags')}")
-    if sc.get("scoreMismatch"):
-        print(f"  ⚠ 점수 불일치: {sc['scoreMismatch']}")
+          f"촬영 {sc.get('capturedZoneCount')}/{sc.get('totalZoneCount')}")
+    # reason·flags·점수 불일치는 앱 응답에서 빠졌다 → --dry 의 [점수 부가] 나 서버 로그에서 확인
     print(f"[해석 · {r.get('interpretationSource')}]")
     for x in r.get("interpretation", []):
         print(f"  - {x}")
@@ -275,6 +274,8 @@ def run_case(base: str, case: str, dry: bool, timeout: int, v2_only: bool = Fals
         if dry:
             print("\n[집계]", json.dumps(data["session"], ensure_ascii=False))
             print("\n[점수]", json.dumps(data["score"], ensure_ascii=False))
+            dbg = {k: v for k, v in data.get("score_debug", {}).items() if k != "zones"}
+            print("[점수 부가]", json.dumps(dbg, ensure_ascii=False))
             print("\n[할 일]")
             for a in data["actions"]:
                 print(f"  {a['title']}  [{a['tag']}]  — {a['detail']}")

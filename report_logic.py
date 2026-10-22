@@ -40,7 +40,7 @@ from collections import Counter
 # ══════════════════════════════════════════════════════════════
 # 이 값을 고칠 때마다 올린다. /dev/reload 와 /health 응답에 그대로 나와서
 # 콜랩에 올린 파일이 실제로 반영됐는지 바로 확인할 수 있다.
-LOGIC_VERSION = "2026-10-21-score-v2.9"
+LOGIC_VERSION = "2026-10-22-score-v2.11"
 
 DISCLAIMER = ("HabiTooth의 분석 결과는 구강 상태 파악을 돕는 보조 진단 및 참고 목적으로만 제공되며, "
               "전문적인 의료 자문, 확진 및 치료를 대신하지 않습니다. "
@@ -1265,11 +1265,12 @@ def _zone_lesion(z: dict) -> str:
 def combine_zone_scores(zones) -> dict:
     """Spring ScoreCalculator.combineZoneScore 와 같은 규칙으로 구역별 합성 점수와 감점을 낸다.
     반환: {viewType: {score, calculusDeduction, plaqueDeduction, calculusZoneScore, plaqueZoneScore,
-                      detectedToothCount}}  — zoneScore 가 None 인 행은 Spring 처럼 제외."""
+                      detectedToothCount}}  — zoneScore 가 None 이거나 zoneValid=False 인 행은 제외.
+    (aggregate_session 과 같은 기준. 무효 구역을 zoneScore 0 으로 보내도 0점 구역이 되지 않게 한다)"""
     by_zone = {}
     for z in zones or []:
         vt, sc = z.get("viewType"), z.get("zoneScore")
-        if vt is None or sc is None:
+        if vt is None or sc is None or not z.get("zoneValid", True):
             continue
         d = by_zone.setdefault(vt, {"calculus": None, "plaque": None, "detected": 0})
         key = "plaque" if _zone_lesion(z) == "PLAQUE" else "calculus"
@@ -1337,7 +1338,7 @@ def compute_score(zones, prev_zones=None, total_score=None, prev_total_score=Non
                 "calculusDeduction": None, "plaqueDeduction": None, "zones": {}}
 
     captured = (int(captured_zone_count) if captured_zone_count is not None
-                else len({z.get("viewType") for z in (zones or []) if z.get("viewType")}))
+                else len(cz))      # Spring 이 안 보내면 유효 구역 수 (무효 구역은 점수에서 빠지므로 개수에서도 뺀다)
     total_zones = int(total_zone_count) if total_zone_count else TOTAL_ZONE_COUNT
 
     # ── 정수화. 감점 합이 100 − 종합 과 정확히 맞도록 치태 쪽에서 나머지를 흡수한다.
@@ -1504,10 +1505,14 @@ def build_actions(ctx: dict) -> list:
     if s["has_calculus"]:
         n = calc["tooth_count"]
         where = f'{calc["regions_text"]} {n}곳.'
+        # 신규·지속이 섞여 있으면 해당하는 곳 수를 밝힌다 (전부 새로 생긴 것처럼 읽히지 않게)
+        n_new, n_per = calc["new_count"], calc["persisted_count"]
         if ctx["primary"] == "NEW_CALCULUS":
-            why = "지난 촬영엔 없던 치석이라 더 굳기 전에 받는 게 좋아요."
+            why = ("지난 촬영엔 없던 치석이라 더 굳기 전에 받는 게 좋아요." if n_per == 0 else
+                   f"이 중 {n_new}곳은 지난 촬영엔 없던 치석이라 더 굳기 전에 받는 게 좋아요.")
         elif ctx["primary"] == "PERSISTENT_CALCULUS":
-            why = "지난 촬영에도 있던 자리라 칫솔질로는 줄지 않아요."
+            why = ("지난 촬영에도 있던 자리라 칫솔질로는 줄지 않아요." if n_new == 0 else
+                   f"이 중 {n_per}곳은 지난 촬영에도 있던 자리라 칫솔질로는 줄지 않아요.")
         else:
             why = "굳은 치석은 칫솔질로 떨어지지 않아요."
         acts.append({"code": "SCALING", "title": "치과 스케일링 예약",
@@ -1661,7 +1666,11 @@ INTERP_SYSTEM_PROMPT = """당신은 구강 관리 앱의 리포트를 쓰는 치
   나쁜 예: "감점은 치석 12.3점에서 발생했으며 칫솔질로 개선 가능해요."
 - 각 항목은 1~2문장, 110자 이내. 모든 문장은 "요."로 끝납니다.
 - "플라크" 대신 "치태", 굳은 것은 "치석".
-- 치석은 칫솔질로 없어지지 않는다는 사실을 거스르는 문장을 쓰지 않습니다."""
+- 치석은 칫솔질로 없어지지 않는다는 사실을 거스르는 문장을 쓰지 않습니다.
+- "돌아와요/돌아오지 않아요"의 주어는 항상 점수(감점)입니다. 치석·치태를 주어로 쓰지 않습니다.
+  "치태는 칫솔질로 되돌아올 수 있어요"는 치태가 다시 생긴다는 뜻이 되어 틀립니다.
+  좋은 예: "치태 감점 17점은 칫솔질로 돌아와요." 나쁜 예: "치태는 칫솔질로 되돌아와요."
+"""
 
 
 def build_interp_prompt(llm_input: dict) -> str:
@@ -1803,7 +1812,14 @@ def validate_interpretation(sentences, llm_input: dict) -> dict:
                  r"(줄어요|줄일 수 있|줄어들어요|없어져요|없앨 수|떨어져요|돌아와요|돌아올 수|되돌아와요|되돌릴 수 있|회복할 수|회복돼요|되찾을 수)",
                  joined):
         fails["치석_칫솔질_오류"] = True
+    # 치환으로 못 고친 형태가 남으면 재시도 (예: "치태도 돌아와요")
+    if re.search(r"(치석|치태)[은는이가도]\s[^.,점]{0,15}?돌아(?:와|올|오)", joined):
+        fails["병변_주어_돌아옴"] = True
     return fails
+
+
+# 병변(치석·치태)이 "돌아오다"의 주어인 경우. 점수 얘기여야 한다.
+_LESION_RETURN = re.compile(r"(치석|치태)([은는이가])(?=\s[^.,점]{0,15}?돌아(?:와|올|오))")
 
 
 # 모델이 반복해서 쓰는 보고서 표현을 재시도 대신 치환으로 고친다 (검증 전에 적용).
@@ -1828,6 +1844,8 @@ INTERP_FIXES = [
     (r"인 것으로 보여요", "이에요"),
     (r"돌아오겠어요", "돌아와요"),
     (r"회복할 수 있어요", "되찾을 수 있어요"),
+    # "치태는 칫솔질로 되돌아올 수 있어요" → "치태 감점은 …" (돌아오는 건 병변이 아니라 점수)
+    (_LESION_RETURN, lambda m: f"{m.group(1)} 감점{'은' if m.group(2) in '은는' else '이'}"),
 ]
 
 
@@ -1907,6 +1925,7 @@ def build_fallback_interpretation(ctx: dict) -> list:
 # 응답 조립
 # ──────────────────────────────────────────────────────────────
 def score_payload(ctx: dict) -> dict:
+    """앱 응답용 점수 블록 — 프론트가 쓰는 필드만 내보낸다."""
     sc = ctx["score"]
     return {
         "total": sc["total"],
@@ -1914,15 +1933,22 @@ def score_payload(ctx: dict) -> dict:
         "delta": sc["delta"],
         "calculusDeduction": sc["calculusDeduction"],
         "plaqueDeduction": sc["plaqueDeduction"],
-        "totalDeduction": sc["totalDeduction"],
         "recoverableByBrushing": sc["recoverableByBrushing"],
         "ceilingByBrushing": sc["ceilingByBrushing"],
         "ceilingAfterScaling": sc["ceilingAfterScaling"],
+        "capturedZoneCount": sc["capturedZoneCount"],
+        "totalZoneCount": sc["totalZoneCount"],
+    }
+
+
+def score_debug(ctx: dict) -> dict:
+    """앱엔 안 나가는 점수 부가 정보. /dev/dry-run 과 서버 로그에서만 쓴다."""
+    sc = ctx["score"]
+    return {
+        "totalDeduction": sc["totalDeduction"],
         "calculusToothCount": ctx["calculus"]["tooth_count"],
         "plaqueToothCount": ctx["plaque"]["tooth_count"],
         "detectedToothCount": sc["detectedToothCount"],
-        "capturedZoneCount": sc["capturedZoneCount"],
-        "totalZoneCount": sc["totalZoneCount"],
         "primaryReason": ctx["primary"],
         "flags": ctx["flags"],
         "formulaText": ("치아마다 100 − 3 × 병변 면적비로 점수를 매기고, 촬영한 치아를 평균했어요. "
