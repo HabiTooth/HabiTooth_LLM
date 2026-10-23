@@ -284,7 +284,6 @@ def run_case(base: str, case: str, dry: bool, timeout: int, v2_only: bool = Fals
                 print(f"  - {x}")
             print("\n[LLM 입력]", json.dumps(data["llm_input"], ensure_ascii=False))
             if not v2_only:
-                print("\n[구형 관리법]", data["legacy"]["picked_titles"])
                 print("\n[해석 프롬프트]\n" + data["interp_prompt"])
         elif v2_only:
             _print_v2(data)

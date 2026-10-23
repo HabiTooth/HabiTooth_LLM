@@ -13,16 +13,14 @@ HabiTooth LLM 리포트 로직.
 
 [역할 분담 — 환각이 사용자에게 도달하는 경로를 차단하는 것이 설계 목표]
 - 사실 (부위·병변·위험도·재측정 주기·이전 측정 대비 변화) : 100% 코드가 결정. LLM 관여 없음.
-- 의학적 권고 (스케일링, 치실 사용법 등)                  : MANAGEMENT_CATALOG 의 고정 텍스트.
+- 의학적 권고 (스케일링, 치실 사용법 등)                  : build_actions 의 '지금 할 일' (코드).
 - 표현 (그 부위가 왜 어렵고 어떻게 닦을지, 그룹당 2문장)   : LLM 생성.
   → polish() 후처리 + assemble_report() 의 검증 15종 + 최대 4회 재생성으로 감싼다.
 - notice / disclaimer                                     : 완전 고정.
 
 [출력 구조]
 - riskDetail  : 관찰 문장(코드) + 변화 문장(코드) + 관리 문장 2개(LLM) + 재측정/호전(코드)
-- management  : 전부 코드. 어떤 항목을 고를지는 측정 결과에 따라 달라지고,
-                문장 자체는 검증된 고정 텍스트를 쓴다. title 은 앱·Spring 과 계약된 값이므로
-                절대 변경하지 않는다.
+- management  : 2026-10-23 제거. 앱의 '지금 할 일'(actions) 카드로 대체됐다.
 - notice      : 촬영이 유효하지 않은 구역이 있을 때만.
 - disclaimer  : 고정.
 
@@ -40,7 +38,7 @@ from collections import Counter
 # ══════════════════════════════════════════════════════════════
 # 이 값을 고칠 때마다 올린다. /dev/reload 와 /health 응답에 그대로 나와서
 # 콜랩에 올린 파일이 실제로 반영됐는지 바로 확인할 수 있다.
-LOGIC_VERSION = "2026-10-22-score-v2.11"
+LOGIC_VERSION = "2026-10-23-score-v2.12"
 
 DISCLAIMER = ("HabiTooth의 분석 결과는 구강 상태 파악을 돕는 보조 진단 및 참고 목적으로만 제공되며, "
               "전문적인 의료 자문, 확진 및 치료를 대신하지 않습니다. "
@@ -111,7 +109,7 @@ DEV_LIMIT = None
 # 문장 후처리
 # 모델 출력에서 반복적으로 관찰된 문제를 강제 교정한다.
 # 규칙은 전부 실측 기반이다. 추측으로 넣지 말고, 실제로 나온 출력을 보고 추가할 것.
-# detail 문장에만 적용된다. management 는 고정 텍스트라 교정이 필요 없다.
+# detail 문장에만 적용된다.
 # 순서 주의: 더 좁은 패턴이 위, 넓은 패턴이 아래.
 # ══════════════════════════════════════════════════════════════
 def _has_final(syl: str) -> bool:
@@ -221,7 +219,7 @@ PHRASE_FIXES = [
     (r"힘드네요", "힘들어요"),
 
     # ── 합쇼체 → 해요체 통일 ───────────────────────────────
-    # (management 는 고정 텍스트라 영향 없음. detail 에만 적용)
+    # (detail 에만 적용)
     # 순서 주의: 불규칙 활용을 먼저 처리하고, 규칙 활용은 아래 함수 치환에 맡긴다.
     (r"하십시오", "하세요"),
     (r"주십시오", "주세요"),
@@ -351,99 +349,6 @@ def trim_sentences(text: str, n: int = SENTENCES_PER_DETAIL) -> str:
 
 
 # ══════════════════════════════════════════════════════════════
-# 관리법 카탈로그 — 항목 선택도 문장도 코드가 담당한다. LLM 관여 없음.
-# title 은 앱과 Spring 이 참조하는 계약된 값이다. 절대 변경 금지.
-#
-#   title  : 앱에 표시되는 제목
-#   region : 문장에 끼울 부위를 어디서 고를지
-#            "calculus" 치석 부위 / "molar" 어금니 부위 /
-#            "anterior" 앞니 부위 / "top" 최우선 부위 / None 부위 없음
-#   text   : {region} 자리표시자가 있는 본문
-#   plain  : 해당 부위가 없을 때 쓰는 대체 본문 (region 이 None 이면 불필요)
-# ══════════════════════════════════════════════════════════════
-MANAGEMENT_CATALOG = {
-    "SCALING": {
-        "title": "치과 스케일링",
-        "region": "calculus",
-        "text": "{region}에서 발견된 치석은 칫솔질로는 떨어지지 않아요. 치석은 이미 단단하게 굳어 치아에 붙어 있어서, 치과에서 초음파 스케일러로 긁어내야 제거됩니다. 6개월에 한 번 정기적으로 받으면 잇몸 염증까지 함께 예방할 수 있어요.",
-        "plain": "치석은 칫솔질로는 떨어지지 않아요. 이미 단단하게 굳어 치아에 붙어 있어서, 치과에서 초음파 스케일러로 긁어내야 제거됩니다. 6개월에 한 번 정기적으로 받으면 잇몸 염증까지 함께 예방할 수 있어요.",
-    },
-    "FOCUSED_BRUSHING": {
-        "title": "집중 부위 칫솔질",
-        "region": "top",
-        "text": "양치를 시작할 때 {region}부터 닦아보세요. 보통 앞니부터 시작해 안쪽으로 갈수록 대충 닦고 끝내기 쉬운데, 순서를 바꾸면 가장 신경 써야 할 곳을 가장 꼼꼼하게 닦게 돼요. 거울을 보면서 그 부위에만 10초를 더 쓰는 것으로도 차이가 납니다.",
-        "plain": "양치할 때 늘 마지막에 닦는 자리를 먼저 닦아보세요. 순서를 바꾸면 평소 대충 지나가던 곳을 가장 꼼꼼하게 닦게 돼요. 거울을 보면서 신경 쓰이는 부위에 10초를 더 쓰는 것으로도 차이가 납니다.",
-    },
-    "BRUSHING_METHOD": {
-        "title": "올바른 칫솔질 방법",
-        "region": None,
-        "text": "칫솔모를 치아와 잇몸이 만나는 경계에 45도로 비스듬히 대고, 그 자리에서 짧고 가볍게 진동시키듯 움직여 주세요. 옆으로 세게 문지르면 치아가 패이고 잇몸이 내려앉을 수 있어요. 입안 전체를 도는 데 2분은 쓰는 것이 좋습니다.",
-    },
-    "FLOSS": {
-        "title": "치실 사용",
-        "region": "anterior",
-        "text": "{region}처럼 치아 사이가 좁은 곳은 칫솔모가 들어가지 못해 치실이 필요해요. 치실을 톱질하듯 좌우로 움직여 천천히 내린 뒤, 한쪽 치아 옆면에 C자로 감아 위아래로 훑어주세요. 반대쪽 면도 같은 방법으로 한 번 더 닦아야 합니다.",
-        "plain": "치아와 치아가 맞닿는 면은 칫솔모가 들어가지 못해 치실이 필요해요. 치실을 톱질하듯 좌우로 움직여 천천히 내린 뒤, 한쪽 치아 옆면에 C자로 감아 위아래로 훑어주세요. 반대쪽 면도 같은 방법으로 한 번 더 닦아야 합니다.",
-    },
-    "INTERDENTAL_BRUSH": {
-        "title": "치간칫솔 사용",
-        "region": "molar",
-        "text": "치간칫솔은 {region}처럼 치아와 치아 사이에 공간이 있는 곳에 넣어 앞뒤로 움직이는 도구예요. 치아 바깥면이나 안쪽 면을 문지르는 용도가 아닙니다. 억지로 밀어 넣으면 잇몸이 상하니, 저항 없이 들어가는 가장 가는 굵기부터 시작하세요.",
-        "plain": "치간칫솔은 치아와 치아 사이에 공간이 있는 곳에 넣어 앞뒤로 움직이는 도구예요. 치아 바깥면이나 안쪽 면을 문지르는 용도가 아닙니다. 억지로 밀어 넣으면 잇몸이 상하니, 저항 없이 들어가는 가장 가는 굵기부터 시작하세요.",
-    },
-    "MOUTHWASH": {
-        "title": "구강세정제 사용",
-        "region": None,
-        "text": "구강세정제는 칫솔질을 대신하지 못하고 어디까지나 보조 수단이에요. 치태는 물리적으로 문질러야 떨어지기 때문입니다. 양치 직후보다는 외출 중이나 간식 뒤처럼 칫솔을 쓰기 어려울 때 사용하는 것이 잘 맞아요.",
-    },
-    "TONGUE_CLEANING": {
-        "title": "혀 세정",
-        "region": None,
-        "text": "혀 표면의 설태에는 세균이 많이 모여 있어서, 그대로 두면 치아에 치태가 다시 쌓이는 속도가 빨라져요. 하루 한 번 양치 마지막에 혀 안쪽에서 바깥쪽으로 부드럽게 쓸어내 주세요. 세게 긁으면 혀 점막이 헐 수 있으니 힘은 빼야 합니다.",
-    },
-    "NIGHT_BRUSHING": {
-        "title": "취침 전 칫솔질",
-        "region": None,
-        "text": "잠든 동안에는 침 분비가 크게 줄어 입안이 세균에 가장 취약해져요. 하루 중 자기 전 양치가 제일 중요한 이유입니다. 양치를 마친 뒤에는 물 외에 아무것도 먹지 않고 바로 자는 습관을 들여보세요.",
-    },
-    "DIET": {
-        "title": "균형 잡힌 식단과 간식 조절",
-        "region": None,
-        "text": "당분이 많은 가공식품이나 캐러멜처럼 치아에 들러붙는 간식은 치태가 자라는 먹이가 돼요. 채소와 과일처럼 섬유질이 있는 음식은 씹는 동안 치아 표면을 자연스럽게 닦아줍니다. 간식 뒤 바로 양치가 어렵다면 물로 입안을 헹궈만 줘도 도움이 돼요.",
-    },
-    "IMMUNITY": {
-        "title": "구강 면역력 관리",
-        "region": None,
-        "text": "잇몸 질환은 세균 자체보다 그에 맞서는 몸의 염증 반응으로 조직이 상하는 병이라, 같은 상태여도 면역력에 따라 정도가 달라져요. 충분한 수면과 균형 잡힌 식사, 스트레스 관리가 그대로 잇몸 상태로 이어집니다. 흡연은 잇몸 혈류를 줄여 회복을 가장 크게 방해해요.",
-    },
-    "HYDRATION": {
-        "title": "수분 섭취와 구강 건조 관리",
-        "region": None,
-        "text": "침은 음식 찌꺼기를 씻어내고 산성으로 기운 입안을 되돌리는 자연 세정액이에요. 물을 자주 조금씩 마시면 이 기능이 유지됩니다. 코가 막혀 입으로 숨을 쉬거나 카페인을 많이 마시면 입안이 마르니 함께 살펴보세요.",
-    },
-    "TOOTHBRUSH_CARE": {
-        "title": "칫솔 관리와 교체",
-        "region": None,
-        "text": "칫솔모가 옆으로 벌어지기 시작하면 치아 면에 제대로 닿지 않아 닦이는 양이 크게 줄어요. 보통 3개월이 기준이지만, 그 전에 벌어졌다면 바로 바꾸는 것이 좋습니다. 사용한 뒤에는 물기를 털고 통풍이 되는 곳에 세워 말려주세요.",
-    },
-    "REGULAR_CHECKUP": {
-        "title": "정기 검진",
-        "region": None,
-        "text": "치석이나 잇몸 염증은 초기에 아프지 않아서 스스로 알아채기 어려워요. 6개월에 한 번 검진을 받으면 눈에 보이기 전 단계에서 잡을 수 있습니다. 지금처럼 상태가 좋을 때 기준을 만들어 두면 나중에 변화를 비교하기도 쉬워요.",
-    },
-    "WATER_FLOSSER": {
-        "title": "구강세정기 사용",
-        "region": None,
-        "text": "구강세정기는 물줄기로 음식 찌꺼기를 밀어내 주지만, 치아 면에 붙은 치태까지 떼어내지는 못해요. 치실이나 치간칫솔을 대신하기보다 함께 쓰는 도구로 생각하세요. 교정 장치를 하고 있거나 손을 쓰기 불편할 때 특히 도움이 됩니다.",
-    },
-}
-
-EXCLUSIVE_GROUPS = [
-    {"FOCUSED_BRUSHING", "BRUSHING_METHOD"},            # 칫솔질 계열
-    {"FLOSS", "INTERDENTAL_BRUSH", "WATER_FLOSSER"},    # 치아 사이 청결 계열
-]
-
-# ══════════════════════════════════════════════════════════════
 # 부위 특성 — 개조식 메모.
 #
 # 완결된 한국어 문장으로 두면 LLM 이 그대로 베껴 쓴다. 실제로 그랬다.
@@ -500,105 +405,6 @@ MAX_HINTS_PER_GROUP = 3
 HINT_COPY_NGRAM = 11
 
 
-def select_management(s: dict, k: int = 3):
-    """측정 결과를 보고 관리법 k개를 규칙으로 확정한다."""
-    sc = {}
-
-    def add(key, w):
-        sc[key] = sc.get(key, 0) + w
-
-    if s["has_calculus"]:
-        add("SCALING", 100)                                   # 치석 있으면 반드시 1위
-    if s["has_plaque"]:
-        add("BRUSHING_METHOD", 40)
-    # 32개 전치아 케이스에서 치아 수 가산점이 SCALING(100)을 넘지 않도록 상한을 둔다.
-    if s["molar_cnt"]:
-        add("INTERDENTAL_BRUSH", 30 + 5 * min(s["molar_cnt"], 8))
-    if s["anterior_cnt"]:
-        add("FLOSS", 30 + 5 * min(s["anterior_cnt"], 8))
-    if s["lower_anterior_calculus"]:                          # 31~43 = 악하선 침샘 근처
-        add("NIGHT_BRUSHING", 35)
-        add("HYDRATION", 18)
-    if s["issue_cnt"] >= 3:
-        add("DIET", 28)
-    if s["top_risk"] in ("CRITICAL", "HIGH"):
-        add("IMMUNITY", 24)
-        add("FOCUSED_BRUSHING", 26)
-    if s["weak_zones"]:
-        add("FOCUSED_BRUSHING", 20)
-    if not s["has_issue"]:
-        add("REGULAR_CHECKUP", 50)
-        add("TOOTHBRUSH_CARE", 40)
-        add("FLOSS", 30)
-
-    # 아무것도 안 걸렸을 때를 위한 기본 풀
-    for key, w in (("MOUTHWASH", 10), ("TONGUE_CLEANING", 8),
-                   ("TOOTHBRUSH_CARE", 7), ("REGULAR_CHECKUP", 6), ("WATER_FLOSSER", 3)):
-        add(key, w)
-
-    ranked = sorted(sc, key=lambda x: (-sc[x], x))
-    picked, used = [], set()
-    for key in ranked:
-        gi = next((i for i, g in enumerate(EXCLUSIVE_GROUPS) if key in g), None)
-        if gi is not None and gi in used:
-            continue
-        picked.append(key)
-        if gi is not None:
-            used.add(gi)
-        if len(picked) == k:
-            return picked
-    for key in ranked:                      # 그룹 제약으로 모자라면 채움
-        if key not in picked:
-            picked.append(key)
-            if len(picked) == k:
-                break
-    return picked
-
-
-def pick_region(s: dict, kind, used=None):
-    """
-    관리법 문장에 끼울 부위 이름을 고른다.
-    used 에 이미 쓴 부위를 넘기면 되도록 겹치지 않는 부위를 먼저 고른다.
-    해당하는 부위가 아예 없으면 None.
-    """
-    if not kind or not s["has_issue"]:
-        return None
-    used = used or set()
-
-    if kind == "top":
-        cands = [i["region"] for i in s["issues"]]
-    elif kind == "calculus":
-        cands = [i["region"] for i in s["issues"] if i["lesion"] == "CALCULUS"]
-    elif kind == "molar":
-        cands = [i["region"] for i in s["issues"] if is_molar(i["tooth"])]
-    elif kind == "anterior":
-        cands = [i["region"] for i in s["issues"] if not is_molar(i["tooth"])]
-    else:
-        return None
-
-    if not cands:
-        return None
-    return next((c for c in cands if c not in used), cands[0])
-
-
-def build_management(s: dict, picked: list):
-    """선택된 항목의 고정 문장을 부위 이름과 함께 조립한다."""
-    out, used = [], set()
-    for key in picked:
-        entry = MANAGEMENT_CATALOG[key]
-        region = pick_region(s, entry.get("region"), used)
-        if region:
-            used.add(region)
-            detail = entry["text"].format(region=region)
-        else:
-            detail = entry.get("plain", entry["text"])
-        out.append({"title": entry["title"], "detail": detail})
-    return out
-
-
-# ══════════════════════════════════════════════════════════════
-# 집계
-# ══════════════════════════════════════════════════════════════
 def fdi_to_region(tooth: int) -> str:
     quadrant, index = tooth // 10, tooth % 10
     vertical = {1: "오른쪽 위", 2: "왼쪽 위", 3: "왼쪽 아래", 4: "오른쪽 아래"}.get(quadrant, "기타")
@@ -990,7 +796,7 @@ def build_report_prompt(s: dict, picked=None) -> str:
 - "관찰돼요", "발견됐어요" 같은 관찰 서술을 쓰지 않는다. 앱이 이미 쓴 문장이다.
 - 첫 문장은 그 부위들이 왜 관리가 어려운지, 둘째 문장은 그 부위들을 어떻게 관리하면 좋은지.
 - '부위 특성 메모'는 완결된 문장이 아니라 사실 조각이다. 이 조각을 근거로 삼되, 표현은 직접 만든다.\n  메모의 단어 배열을 그대로 이어 붙이지 않는다. 메모에 없는 해부학 설명을 지어내지도 않는다.\n  메모가 2개 이상이면 억지로 다 넣지 말고, 그 부위에 가장 중요한 것을 골라 한 문장으로 쓴다.
-- 병변을 제거하는 방법이나 치과 치료를 언급하지 않는다. 앱이 '관리법' 항목에서 따로 안내한다.
+- 병변을 제거하는 방법이나 치과 치료를 언급하지 않는다. 앱이 '지금 할 일' 항목에서 따로 안내한다.
   둘째 문장은 그 부위를 칫솔로 닦는 방법만 쓴다. "제거하기 위해", "없애려면" 같은 말을 쓰지 않는다.
 - 두 그룹에 같은 동작 표현을 쓰지 않는다.\n- 지난 측정과의 비교나 호전 여부는 쓰지 않는다. 앱이 따로 표시한다.
 - 칫솔 동작은 다음 표현 중에서만 골라 쓴다. 비유나 새로운 표현을 지어내지 않는다.
@@ -1066,14 +872,14 @@ def _copies_hint(detail: str, hints, n: int = HINT_COPY_NGRAM) -> bool:
 BANNED_WORDS = ["이어폰", "빗자루", "붓처럼", "지우개", "칼처럼",
                 "복부", "배 근처", "가슴", "목구멍", "식도", "위장", "코 근처",
                 # 칫솔질에 힘을 주라는 조언은 의학적으로 틀렸다.
-                # MANAGEMENT_CATALOG 의 BRUSHING_METHOD 와 정면으로 충돌한다.
+                # 할 일(actions)의 칫솔질 안내와 정면으로 충돌한다.
                 # 긍정 명령형만 잡는다. "세게 문지르지 않아도" 같은 부정형은
                 # 올바른 조언이므로 차단하지 않는다.
                 "힘차게", "힘껏", "빡빡",
                 "세게 문질러", "세게 닦아", "강하게 문질러", "강하게 닦아",
                 "힘주어 문질러", "힘을 주어 닦", "힘을 주어 문질",
                 # 좁은 틈에 칫솔을 밀어 넣으라는 조언도 잇몸을 상하게 한다.
-                # MANAGEMENT_CATALOG 의 INTERDENTAL_BRUSH 와 충돌한다.
+                # 할 일(actions)의 치간칫솔 안내와 충돌한다.
                 "밀어 넣어야", "밀어넣어야", "깊숙이 밀어", "억지로 넣"]
 
 # 앱이 따로 표시하는 정보가 문장에 새어 나오는지
@@ -1086,7 +892,7 @@ _LATIN_LEAK = re.compile(r"[A-Za-z]{3,}")
 _TREATMENT_LEAK = re.compile(r"스케일|제거|떼어내|떼어 내|없애|없앨|긁어내|치과|시술|치료")
 
 
-def assemble_report(s: dict, llm_out: dict, picked: list):
+def assemble_report(s: dict, llm_out: dict, picked=None):
     raw = [d for d in llm_out.get("details", []) if isinstance(d, str)]
     details = [trim_sentences(polish(d)) for d in raw]
 
@@ -1119,7 +925,7 @@ def assemble_report(s: dict, llm_out: dict, picked: list):
             "riskLevel": "VERY_LOW",
         })
 
-    report = {"riskDetail": risk_detail, "management": build_management(s, picked)}
+    report = {"riskDetail": risk_detail}
     notice = build_notice(s)
     if notice:
         report["notice"] = notice
@@ -1132,8 +938,8 @@ def assemble_report(s: dict, llm_out: dict, picked: list):
     bad_sentence_cnt = any(len(split_sentences(d)) != SENTENCES_PER_DETAIL for d in details)
     # 치료·제거 언급 누수.
     #   치석은 칫솔질로 제거되지 않는다. "치석을 제거하기 위해 칫솔로 닦으세요"는
-    #   의학적으로 틀린 정보이고, MANAGEMENT_CATALOG 의 '치과 스케일링' 과 충돌한다.
-    #   스케일링 안내는 management 항목이 이미 정확하게 다루므로 detail 에서는 금지한다.
+    #   의학적으로 틀린 정보이고, 할 일(actions)의 스케일링 안내와 충돌한다.
+    #   스케일링 안내는 할 일(actions)이 이미 정확하게 다루므로 detail 에서는 금지한다.
     treatment_leak = any(_TREATMENT_LEAK.search(d) for d in details)
     dup_action = any(_overlaps(a, b) for a, b in itertools.combinations(details, 2))
     has_banned_word = any(b in d for d in details for b in BANNED_WORDS)
@@ -1185,7 +991,7 @@ HEALTHY_RESOLVED = ("이번 측정에서는 치석이나 치태가 발견되지 
                     "지난번에 관찰됐던 {resolved}도 이번에는 보이지 않아 잘 관리되고 있어요.")
 
 
-def build_healthy_report(s: dict, picked: list):
+def build_healthy_report(s: dict, picked=None):
     if s["resolved"]:
         detail = HEALTHY_RESOLVED.format(resolved=summarize_resolved(s))
     else:
@@ -1196,7 +1002,6 @@ def build_healthy_report(s: dict, picked: list):
             "detail": (detail + " " + recheck_sentence(s)).strip(),
             "riskLevel": "VERY_LOW",
         }],
-        "management": build_management(s, picked),
         "disclaimer": DISCLAIMER,
     }
     notice = build_notice(s)
@@ -1960,8 +1765,8 @@ def score_debug(ctx: dict) -> dict:
     }
 
 
-def build_code_only_report(s: dict, picked: list) -> dict:
-    """LLM 문장 없이 riskDetail / management 를 만든다 (구형 섹션을 LLM 없이 유지할 때)."""
+def build_code_only_report(s: dict, picked=None) -> dict:
+    """LLM 문장 없이 riskDetail 을 만든다 (LLM 이 전부 실패했을 때)."""
     groups = group_by_lesion(s) if s["has_issue"] else []
     risk_detail = []
     for g in groups:
@@ -1974,7 +1779,7 @@ def build_code_only_report(s: dict, picked: list) -> dict:
         rn = build_resolved_note(s)
         if rn:
             risk_detail[-1]["detail"] = (risk_detail[-1]["detail"] + " " + rn).strip()
-    report = {"riskDetail": risk_detail, "management": build_management(s, picked)}
+    report = {"riskDetail": risk_detail}
     notice = build_notice(s)
     if notice:
         report["notice"] = notice

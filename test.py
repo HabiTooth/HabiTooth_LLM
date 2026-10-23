@@ -19,7 +19,7 @@
 #   HABITOOTH_CONCURRENCY  기본 4 (동시에 Bedrock 에 보낼 리포트 수)
 #   HABITOOTH_NO_THINK     기본 1 (프롬프트 끝에 /no_think 추가)
 #   HABITOOTH_TIMEOUT      기본 120 (초, Bedrock read timeout)
-#   HABITOOTH_LEGACY_LLM   기본 1 — 구형 riskDetail 관리 문장도 LLM 으로 생성 (0 이면 코드 문장만)
+#   HABITOOTH_LEGACY_LLM   기본 1 — riskDetail 관리 문장을 LLM 으로 생성 (0 이면 코드 문장만)
 #   HABITOOTH_INTERP_LLM   기본 1 — v2 해석(interpretation) 을 LLM 으로 생성 (0 이면 폴백 문장)
 #
 # 프롬프트·카탈로그·집계 규칙은 report_logic.py 에 있고,
@@ -227,8 +227,8 @@ def extract_json(text: str):
     return None
 
 
-def run_generation(s: dict, picked: list, max_retry: int = MAX_RETRY):
-    user_prompt = report_logic.build_report_prompt(s, picked)
+def run_generation(s: dict, max_retry: int = MAX_RETRY):
+    user_prompt = report_logic.build_report_prompt(s)
     last = None
     for i in range(max_retry):
         greedy = (i == max_retry - 1)      # 마지막 시도는 결정적으로
@@ -259,7 +259,7 @@ def run_generation(s: dict, picked: list, max_retry: int = MAX_RETRY):
             print(f"[LLM] JSON 파싱 실패, 재시도 | 원문 앞부분: {text[:120]!r}")
             continue
 
-        report, needs_retry = report_logic.assemble_report(s, llm_out, picked)
+        report, needs_retry = report_logic.assemble_report(s, llm_out)
         last = report
         if not needs_retry:
             break
@@ -322,20 +322,19 @@ def generate_llm_report(req: ReportRequest):
                                            req.capturedZoneCount, req.totalZoneCount)
         ctx = report_logic.build_context(s, score)
         actions = report_logic.build_actions(ctx)
-        picked = report_logic.select_management(s, k=3)
         print(f"[LLM] 병변 {s['issue_cnt']}건 / 점수 {score['total']} "
               f"(치석 -{score['calculusDeduction']} 치태 -{score['plaqueDeduction']}) "
               f"/ reason {ctx['primary']} {ctx['flags']} / 할 일 {[a['code'] for a in actions]}")
         if score.get("mismatch"):
             print(f"[LLM] ⚠ 점수 불일치 (Spring vs 재계산): {score['mismatch']}")
 
-        # ── 구형 섹션 (riskDetail / management) — 앱이 새 UI 로 바뀔 때까지 유지
+        # ── riskDetail (3D 치아 카드의 AI 가이드). management 는 2026-10-23 제거 → actions 로 대체
         if not s["has_issue"]:
-            report = report_logic.build_healthy_report(s, picked)
+            report = report_logic.build_healthy_report(s)
         elif LEGACY_LLM:
-            report = run_generation(s, picked) or report_logic.build_code_only_report(s, picked)
+            report = run_generation(s) or report_logic.build_code_only_report(s)
         else:
-            report = report_logic.build_code_only_report(s, picked)
+            report = report_logic.build_code_only_report(s)
 
         # ── v2 섹션
         interp, source = run_interpretation(ctx, actions)
@@ -355,8 +354,7 @@ def dev_reload():
     """report_logic.py 만 다시 읽는다."""
     importlib.reload(report_logic)
     return {"reloaded": "report_logic",
-            "logic_version": getattr(report_logic, "LOGIC_VERSION", "(없음 — 옛 파일)"),
-            "catalog_size": len(report_logic.MANAGEMENT_CATALOG)}
+            "logic_version": getattr(report_logic, "LOGIC_VERSION", "(없음 — 옛 파일)")}
 
 
 @app.post("/dev/dry-run")
@@ -368,10 +366,9 @@ def dev_dry_run(req: ReportRequest):
                                        req.capturedZoneCount, req.totalZoneCount)
     ctx = report_logic.build_context(s, score)
     actions = report_logic.build_actions(ctx)
-    picked = report_logic.select_management(s, k=3)
     llm_input = report_logic.build_llm_input(ctx, actions)
     interp_prompt = report_logic.build_interp_prompt(llm_input)
-    legacy_prompt = report_logic.build_report_prompt(s, picked)
+    legacy_prompt = report_logic.build_report_prompt(s)
     return {
         "session": {k: v for k, v in s.items() if k != "issues"},
         "issues": s["issues"],
@@ -383,10 +380,7 @@ def dev_dry_run(req: ReportRequest):
         "fallback_interpretation": report_logic.build_fallback_interpretation(ctx),
         "legacy": {
             "groups": report_logic.group_by_lesion(s),
-            "picked": picked,
-            "picked_titles": [report_logic.MANAGEMENT_CATALOG[k]["title"] for k in picked],
             "prompt": legacy_prompt,
-            "management": report_logic.build_management(s, picked),
         },
     }
 
