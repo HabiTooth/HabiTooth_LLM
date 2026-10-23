@@ -10,7 +10,8 @@
 #   python test_client.py --case full --dry  # 모델 안 돌리고 프롬프트만
 #   python test_client.py --case all         # 전 케이스 순차 실행
 #   python test_client.py --case v2-new-calculus --dry   # v2: 점수 분해·할 일·프롬프트·폴백만
-#   python test_client.py --case v2 --v2     # v2 케이스 6개 실제 생성, score/interpretation/actions 만 출력
+#   python test_client.py --case v2 --v2     # v2 케이스 실제 생성, score/interpretation/actions 만 출력
+#   python test_client.py --case many --full # 병변 많은 케이스 3개, riskDetail 포함 전체 JSON
 #   python test_client.py --base https://xxxx.trycloudflare.com   # Colab 터널
 import argparse
 import json
@@ -208,6 +209,57 @@ V2_F_PREV = [{"toothNumber": 41, "lesionType": "CALCULUS", "areaRatio": 15.0},
              {"toothNumber": 41, "lesionType": "PLAQUE", "areaRatio": 10.0},
              {"toothNumber": 36, "lesionType": "PLAQUE", "areaRatio": 12.0}]
 
+# G. 병변 많음 — 13구역 전부 촬영, 광원별 2행, 치아 28개에 치석·치태 (실제 Spring 형식)
+#    zoneScore 는 그 구역 치아의 병변별 점수 평균 (= 100 − 3 × 평균 면적비) 으로 맞춘다.
+ZONE_TEETH = {
+    "UPPER_RIGHT_MOLAR": [16, 17, 18], "UPPER_RIGHT_PREMOLAR": [14, 15], "UPPER_FRONT": [11, 12, 13, 21, 22, 23],
+    "UPPER_LEFT_PREMOLAR": [24, 25], "UPPER_LEFT_MOLAR": [26, 27, 28],
+    "LOWER_RIGHT_MOLAR": [46, 47, 48], "LOWER_RIGHT_PREMOLAR": [44, 45], "LOWER_FRONT": [31, 32, 33, 41, 42, 43],
+    "LOWER_LEFT_PREMOLAR": [34, 35], "LOWER_LEFT_MOLAR": [36, 37, 38],
+    "OUTER_RIGHT": [14, 15, 16, 44, 45, 46], "OUTER_CENTER": [11, 12, 21, 22, 31, 32, 41, 42],
+    "OUTER_LEFT": [24, 25, 26, 34, 35, 36],
+}
+
+
+def _zones_from_teeth(teeth, views=None):
+    """치아 행에서 구역×광원 행을 만든다. 병변 없는 구역은 100점."""
+    by = {(t["toothNumber"], t["lesionType"]): t["areaRatio"] for t in teeth}
+    rows = []
+    for v, ts in ZONE_TEETH.items():
+        if views and v not in views:
+            continue
+        for light, lesion in (("WHITE", "CALCULUS"), ("UV", "PLAQUE")):
+            ratios = [by.get((t, lesion), 0.0) for t in ts]
+            avg = sum(ratios) / len(ratios)
+            rows.append(_z(v, light, round(100 - 3 * avg, 1), len(ts),
+                           calc=round(avg, 1) if lesion == "CALCULUS" else None,
+                           plq=round(avg, 1) if lesion == "PLAQUE" else None))
+    return rows
+
+
+_MANY_CALC = {16: 14.0, 17: 18.0, 26: 12.0, 27: 16.0, 36: 10.0, 37: 15.0, 46: 11.0, 47: 13.0,
+              31: 20.0, 32: 12.0, 41: 22.0, 42: 9.0, 33: 6.0, 43: 5.0}
+_MANY_PLQ = {11: 8.0, 12: 6.0, 13: 5.0, 21: 9.0, 22: 7.0, 23: 4.0, 14: 6.0, 15: 5.0, 24: 7.0, 25: 4.0,
+             34: 8.0, 35: 6.0, 44: 9.0, 45: 5.0, 36: 12.0, 37: 10.0, 46: 11.0, 47: 9.0,
+             16: 7.0, 17: 6.0, 26: 8.0, 27: 5.0, 31: 10.0, 41: 12.0}
+V2_G_TEETH = ([_t(t, "CALCULUS", r) for t, r in _MANY_CALC.items()] +
+              [_t(t, "PLAQUE", r) for t, r in _MANY_PLQ.items()])
+V2_G_ZONES = _zones_from_teeth(V2_G_TEETH)
+
+# H. 병변 많음 + 지난 기록 많음 — 사라진 병변이 많아 '지난번 보였던 …' 문장이 길어지는지 확인
+#    (리포트 카드 4번째 캡처와 같은 상황)
+V2_H_PREV = ([{"toothNumber": t, "lesionType": "CALCULUS", "areaRatio": r} for t, r in
+              {16: 12.0, 17: 18.0, 26: 12.0, 31: 18.0, 41: 20.0, 21: 6.0, 11: 5.0, 35: 4.0}.items()] +
+             [{"toothNumber": t, "lesionType": "PLAQUE", "areaRatio": r} for t, r in
+              {11: 10.0, 21: 11.0, 36: 14.0, 46: 12.0, 18: 6.0, 28: 7.0, 38: 8.0, 48: 6.0,
+               32: 9.0, 33: 7.0, 42: 8.0, 43: 6.0, 13: 5.0, 23: 6.0}.items()])
+
+# I. 극단 — 32개 치아 모두 치석·치태, 면적비 큼. 점수 하한(0)·문장 길이 상한 확인
+_ALL32 = [q * 10 + i for q in (1, 2, 3, 4) for i in range(1, 9)]
+V2_I_TEETH = ([_t(t, "CALCULUS", 18.0 + (t % 7) * 3) for t in _ALL32] +
+              [_t(t, "PLAQUE", 15.0 + (t % 5) * 4) for t in _ALL32])
+V2_I_ZONES = _zones_from_teeth(V2_I_TEETH)
+
 V2_CASES = {
     "v2-new-calculus": {"zones": V2_A_ZONES, "teeth": V2_A_TEETH, "prevTeeth": V2_A_PREV,
                         "totalScore": 87.3, "prevTotalScore": 96.0, "capturedZoneCount": 3},
@@ -221,6 +273,12 @@ V2_CASES = {
                         "capturedZoneCount": 2},
     "v2-worsening":    {"zones": V2_F_ZONES, "teeth": V2_F_TEETH, "prevTeeth": V2_F_PREV,
                         "totalScore": 70.0, "prevTotalScore": 78.0, "capturedZoneCount": 3},
+    "v2-many-first":   {"zones": V2_G_ZONES, "teeth": V2_G_TEETH, "prevTeeth": None,
+                        "capturedZoneCount": 13},
+    "v2-many-prev":    {"zones": V2_G_ZONES, "teeth": V2_G_TEETH, "prevTeeth": V2_H_PREV,
+                        "prevTotalScore": 72.0, "capturedZoneCount": 13},
+    "v2-many-extreme": {"zones": V2_I_ZONES, "teeth": V2_I_TEETH, "prevTeeth": None,
+                        "capturedZoneCount": 13},
 }
 
 CASES = {
@@ -301,9 +359,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://localhost:8001")
     ap.add_argument("--case", default="mid",
-                    choices=list(CASES) + ["all", "v2"])
+                    choices=list(CASES) + ["all", "v2", "many"])
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--v2", action="store_true", help="score / interpretation / actions 만 출력")
+    ap.add_argument("--full", action="store_true", help="v2 케이스도 riskDetail 포함 전체 JSON 출력")
     ap.add_argument("--timeout", type=int, default=1200)
     # 예전 호출 방식(python test_client.py dry) 호환
     if len(sys.argv) > 1 and sys.argv[1] == "dry":
@@ -314,10 +373,13 @@ def main():
         cases = list(CASES)
     elif args.case == "v2":
         cases = list(V2_CASES)
+    elif args.case == "many":
+        cases = [c for c in V2_CASES if c.startswith("v2-many")]
     else:
         cases = [args.case]
     for c in cases:
-        run_case(args.base.rstrip("/"), c, args.dry, args.timeout, v2_only=args.v2 or c.startswith("v2-"))
+        v2_only = (args.v2 or c.startswith("v2-")) and not args.full
+        run_case(args.base.rstrip("/"), c, args.dry, args.timeout, v2_only=v2_only)
 
 
 if __name__ == "__main__":
