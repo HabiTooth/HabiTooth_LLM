@@ -38,7 +38,7 @@ from collections import Counter
 # ══════════════════════════════════════════════════════════════
 # 이 값을 고칠 때마다 올린다. /dev/reload 와 /health 응답에 그대로 나와서
 # 콜랩에 올린 파일이 실제로 반영됐는지 바로 확인할 수 있다.
-LOGIC_VERSION = "2026-10-23-score-v2.12"
+LOGIC_VERSION = "2026-10-23-score-v2.13"
 
 DISCLAIMER = ("HabiTooth의 분석 결과는 구강 상태 파악을 돕는 보조 진단 및 참고 목적으로만 제공되며, "
               "전문적인 의료 자문, 확진 및 치료를 대신하지 않습니다. "
@@ -139,6 +139,12 @@ def _copula(m):
 
 
 PHRASE_FIXES = [
+    # ── 뜻이 뒤집히는 표현 (2026-10-23 시연 전 점검에서 발견) ──────
+    (r"닦기 쉬운 곳이 아니에요", "닦기 어려운 곳이에요"),
+    (r"닦기 쉬운 곳이에요", "놓치기 쉬운 곳이에요"),
+    (r"부위에요", "부위예요"),
+    (r"최악(의)? 구역", "가장 낮은 구역"),
+
     # ── 오타 ────────────────────────────────────────────────
     (r"닻아", "닦아"),
     (r"닥아", "닦아"),
@@ -1491,13 +1497,13 @@ def build_interp_prompt(llm_input: dict) -> str:
 # 검증 — 숫자 화이트리스트가 핵심
 # ──────────────────────────────────────────────────────────────
 _NUM_RE = re.compile(r"\d+(?:\.\d+)?")
-_IMPERATIVE_LEAK = re.compile(r"(하세요|해\s?주세요|주세요|받으세요|해\s?보세요|권장|권해요|챙기세요|신경\s?써|촬영해요|촬영해\s?보|촬영하면 좋)")
+_IMPERATIVE_LEAK = re.compile(r"(하세요|해\s?주세요|주세요|받으세요|해\s?보세요|권장|권해요|챙기세요|신경\s?써|촬영해요|촬영해\s?보|촬영하면 좋|확인해요|확인해\s?보)")
 _GRADE_LEAK = re.compile(r"([A-F]\s?등급|등급|CRITICAL|HIGH|MEDIUM|LOW)")
 _ENDING_OK = re.compile(r"(요|죠)[.!]?$")
 # 숫자 뒤에 단위가 없는 경우 ("9.9까지", "3.9 올랐")
 _UNITLESS_NUM = re.compile(r"(?<![\d.])\d+(?:\.\d+)?(?![\d.])(?!\s*(?:점|곳|구역|개|%|번|회|주|개월|일))")
 # 문어체 연결·보고서 표현
-_WRITTEN_STYLE = re.compile(r"([가-힣]며(?:[\s,.]|$)|발생|개선 가능|개선이 기대|기대됩니다|최고 점수|것으로 보여요|것 같아요|모습이에요)")
+_WRITTEN_STYLE = re.compile(r"([가-힣]며(?:[\s,.]|$)|발생|개선 가능|개선이 기대|개선되었|개선할 수|기대됩니다|기대되|최고 점수|최악|것으로 보여요|것 같아요|모습이에요)")
 
 
 def _collect_numbers(obj, acc: set):
@@ -1617,6 +1623,26 @@ def validate_interpretation(sentences, llm_input: dict) -> dict:
                  r"(줄어요|줄일 수 있|줄어들어요|없어져요|없앨 수|떨어져요|돌아와요|돌아올 수|되돌아와요|되돌릴 수 있|회복할 수|회복돼요|되찾을 수)",
                  joined):
         fails["치석_칫솔질_오류"] = True
+    # 추세와 반대로 말하는 경우 ("치석이 새로 생겼는데 치석은 그대로예요")
+    #   추세는 면적비 1%p 차이로도 UP/DOWN 이 되므로 "그대로"는 확실히 틀린 경우만 잡는다:
+    #   전부 새로 생겼는데(지속 0) "그대로", 또는 방향을 정반대로 말한 경우.
+    for key, kr in (("calculus", "치석"), ("plaque", "치태")):
+        g = llm_input.get(key) or {}
+        tr, new_c, per_c = g.get("trend"), g.get("new_count") or 0, g.get("persisted_count") or 0
+        for m in re.finditer(kr + r"[은는이가도]?\s?(?:\d+점\s?)?(그대로|늘|줄|많아|적어)", joined):
+            w = m.group(1)
+            if (w == "그대로" and new_c > 0 and per_c == 0) or \
+               (tr == "UP" and w in ("줄", "적어")) or \
+               (tr == "DOWN" and w in ("늘", "많아")):
+                fails["추세_모순"] = f"{kr} {tr} ↔ '{m.group(0)}'"
+                break
+    # "8개 구역" 처럼 치아 수를 구역 수로 쓰는 경우
+    cov = llm_input.get("coverage") or {}
+    zone_ok = {cov.get("captured_zones"), cov.get("total_zones")}
+    for m in re.finditer(r"(\d+)\s*개?\s*구역", joined):
+        if int(m.group(1)) not in zone_ok:
+            fails["구역수_오류"] = m.group(0)
+            break
     # 치환으로 못 고친 형태가 남으면 재시도 (예: "치태도 돌아와요")
     if re.search(r"(치석|치태)[은는이가도]\s[^.,점]{0,15}?돌아(?:와|올|오)", joined):
         fails["병변_주어_돌아옴"] = True
@@ -1648,18 +1674,37 @@ INTERP_FIXES = [
     (r"기대돼요", "기대할 수 있어요"),
     (r"인 것으로 보여요", "이에요"),
     (r"돌아오겠어요", "돌아와요"),
+    (r"\s?(?:개선되었고|개선됐고)(?=,)", ""),           # "줄어들고 개선되었고," → "줄어들고,"
+    (r"개선되었어요", "좋아졌어요"),
+    (r"점수 상승이 기대되지 않아요", "점수가 오르지 않아요"),
+    (r"개선할 수 있는 점수가 없어요", "올릴 수 있는 점수가 없어요"),
     (r"회복할 수 있어요", "되찾을 수 있어요"),
     # "치태는 칫솔질로 되돌아올 수 있어요" → "치태 감점은 …" (돌아오는 건 병변이 아니라 점수)
     (_LESION_RETURN, lambda m: f"{m.group(1)} 감점{'은' if m.group(2) in '은는' else '이'}"),
 ]
 
 
-def finalize_interpretation(sentences) -> list:
+def fix_ceiling(x: str, llm_input) -> str:
+    """'치태 17점까지 올릴 수 있어요'처럼 되찾는 점수(17)를 상한 자리에 쓴 경우 상한(87)으로 바꾼다.
+    모델이 재시도마다 같은 실수를 반복해서(greedy 마지막 시도 포함) 치환으로 막는다."""
+    sc = (llm_input or {}).get("score") or {}
+    rb, ceil = sc.get("recoverable_by_brushing"), sc.get("ceiling_by_brushing")
+    if rb is None or ceil is None or rb == ceil:
+        return x
+    return re.sub(rf"(?:치태\s*(?:감점\s*)?)?(?<![\d.]){_num(rb)}\s*점\s*까지", f"{_num(ceil)}점까지", x)
+
+
+def finalize_interpretation(sentences, llm_input=None) -> list:
     out = []
     for x in sentences:
         x = polish(x)
         for pat, rep in INTERP_FIXES:
             x = re.sub(pat, rep, x)
+        x = fix_ceiling(x, llm_input)
+        # 한 항목에 3문장 이상이면 앞의 문장만 남긴다 (재시도보다 싸다)
+        parts = split_sentences(x)
+        if len(parts) > INTERP_MAX_SENTENCES:
+            x = " ".join(parts[:INTERP_MAX_SENTENCES])
         if x and not x.endswith((".", "!", "?")):
             x += "."
         out.append(x)

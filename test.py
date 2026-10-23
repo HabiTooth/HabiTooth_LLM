@@ -293,7 +293,7 @@ def run_interpretation(ctx: dict, actions: list, max_retry: int = MAX_RETRY):
         if not out or "interpretation" not in out:
             print(f"[INTERP] JSON 파싱 실패 | 원문 앞부분: {text[:120]!r}")
             continue
-        sents = report_logic.finalize_interpretation(out["interpretation"]) \
+        sents = report_logic.finalize_interpretation(out["interpretation"], llm_input) \
             if isinstance(out["interpretation"], list) else None
         fails = report_logic.validate_interpretation(sents, llm_input)
         if not fails:
