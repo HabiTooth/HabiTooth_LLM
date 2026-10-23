@@ -38,7 +38,7 @@ from collections import Counter
 # ══════════════════════════════════════════════════════════════
 # 이 값을 고칠 때마다 올린다. /dev/reload 와 /health 응답에 그대로 나와서
 # 콜랩에 올린 파일이 실제로 반영됐는지 바로 확인할 수 있다.
-LOGIC_VERSION = "2026-10-23-score-v2.13"
+LOGIC_VERSION = "2026-10-23-score-v2.14"
 
 DISCLAIMER = ("HabiTooth의 분석 결과는 구강 상태 파악을 돕는 보조 진단 및 참고 목적으로만 제공되며, "
               "전문적인 의료 자문, 확진 및 치료를 대신하지 않습니다. "
@@ -876,6 +876,8 @@ def _copies_hint(detail: str, hints, n: int = HINT_COPY_NGRAM) -> bool:
 
 
 BANNED_WORDS = ["이어폰", "빗자루", "붓처럼", "지우개", "칼처럼",
+                # 관리가 어려운 이유를 쓰는 자리에 "쉽다"고 쓴 경우 (뜻 반전)
+                "관리가 쉬워", "닦기 쉬워", "쉬워 보여", "관리하기 쉬운",
                 "복부", "배 근처", "가슴", "목구멍", "식도", "위장", "코 근처",
                 # 칫솔질에 힘을 주라는 조언은 의학적으로 틀렸다.
                 # 할 일(actions)의 칫솔질 안내와 정면으로 충돌한다.
@@ -991,7 +993,7 @@ def assemble_report(s: dict, llm_out: dict, picked=None):
 
 
 HEALTHY_DETAIL = ("이번 측정에서는 치석이나 치태가 발견되지 않았어요. "
-                  "지금의 관리 습관을 그대로 이어가시면 좋겠습니다.")
+                  "지금 관리 습관을 그대로 이어가면 돼요.")
 
 HEALTHY_RESOLVED = ("이번 측정에서는 치석이나 치태가 발견되지 않았어요. "
                     "지난번에 관찰됐던 {resolved}도 이번에는 보이지 않아 잘 관리되고 있어요.")
@@ -1629,13 +1631,28 @@ def validate_interpretation(sentences, llm_input: dict) -> dict:
     for key, kr in (("calculus", "치석"), ("plaque", "치태")):
         g = llm_input.get(key) or {}
         tr, new_c, per_c = g.get("trend"), g.get("new_count") or 0, g.get("persisted_count") or 0
-        for m in re.finditer(kr + r"[은는이가도]?\s?(?:\d+점\s?)?(그대로|늘|줄|많아|적어)", joined):
+        for m in re.finditer(kr + r"\s?(?:감점)?[은는이가도]?\s?(?:\d+점(?:에서|으로)?\s?)*(그대로|늘|줄|많아|적어)", joined):
             w = m.group(1)
             if (w == "그대로" and new_c > 0 and per_c == 0) or \
                (tr == "UP" and w in ("줄", "적어")) or \
                (tr == "DOWN" and w in ("늘", "많아")):
                 fails["추세_모순"] = f"{kr} {tr} ↔ '{m.group(0)}'"
                 break
+        # 있는 병변을 없다고, 새로 생긴 걸 안 생겼다고, 사라진 게 있는데 없다고 하는 경우
+        if (g.get("tooth_count") or 0) > 0 and \
+                re.search(kr + r"[은는이가도]?\s?(없어|없었|보이지 않|안 보)", joined):
+            fails["있는_병변_부정"] = kr
+        if new_c > 0 and re.search(kr + r"[은는이가도]?\s?새로 생기지 않", joined):
+            fails["신규_부정"] = kr
+    resolved_any = sum((llm_input.get(k) or {}).get("resolved_count") or 0 for k in ("calculus", "plaque"))
+    if resolved_any and re.search(r"(개선된|좋아진|사라진)\s?(부분|곳|자리)[은는이가도]?\s?없", joined):
+        fails["호전_부정"] = True
+    # 이전 기록이 있는데 처음이라고 하는 경우
+    sc_in = llm_input.get("score") or {}
+    has_prev_any = sc_in.get("prev_total") is not None or any(
+        (llm_input.get(k) or {}).get("trend") not in (None, "UNKNOWN") for k in ("calculus", "plaque"))
+    if has_prev_any and re.search(r"(처음|첫 촬영|첫 측정|비교할 수 없|비교 기준이 없|이전 기록이 없)", joined):
+        fails["이전기록_부정"] = True
     # "8개 구역" 처럼 치아 수를 구역 수로 쓰는 경우
     cov = llm_input.get("coverage") or {}
     zone_ok = {cov.get("captured_zones"), cov.get("total_zones")}
@@ -1678,6 +1695,9 @@ INTERP_FIXES = [
     (r"개선되었어요", "좋아졌어요"),
     (r"점수 상승이 기대되지 않아요", "점수가 오르지 않아요"),
     (r"개선할 수 있는 점수가 없어요", "올릴 수 있는 점수가 없어요"),
+    (r"개선이 어려워요", "줄지 않아요"),
+    (r"감점 (\d+)점 중 \1점이", r"감점 \1점은 모두"),                    # "31점 중 31점이" → "31점은 모두"
+    (r"(\d+)점에서 (\d+)점 (줄|늘|내려|올라)", r"\1점에서 \2점으로 \3"),  # "13점에서 10점 줄었어요" (10점만큼 준 것처럼 읽힘)
     (r"회복할 수 있어요", "되찾을 수 있어요"),
     # "치태는 칫솔질로 되돌아올 수 있어요" → "치태 감점은 …" (돌아오는 건 병변이 아니라 점수)
     (_LESION_RETURN, lambda m: f"{m.group(1)} 감점{'은' if m.group(2) in '은는' else '이'}"),
